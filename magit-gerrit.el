@@ -195,14 +195,10 @@ parameter of `magit-insert-section'."
   (magit-git-string (magit-gerrit-select-remote-url-cmd) magit-gerrit-remote))
 
 (defun magit-gerrit-get-project ()
-  (let* ((regx (rx (zero-or-one ?:) (zero-or-more (any digit)) ?/
-                   (group (not (any "/")))
-                   (group (one-or-more (not (any "."))))))
-         (str (or (magit-gerrit-get-remote-url) ""))
-         (sstr (car (last (split-string str "//")))))
-    (when (string-match regx sstr)
-      (concat (match-string 1 sstr)
-              (match-string 2 sstr)))))
+  (when-let* ((url (magit-gerrit-get-remote-url))
+              (url (url-generic-parse-url url))
+              (prj (url-filename url)))
+    (string-trim-right (string-trim-left prj "/") "\\.git")))
 
 (defun magit-gerrit-string-real-length (s)
   (if (multibyte-string-p s)
