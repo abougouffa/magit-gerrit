@@ -81,6 +81,7 @@
 (require 'transient)
 (require 'json)
 (require 'mule-util)
+(require 'savehist)
 (eval-when-compile (require 'cl-lib))
 
 (defvar-local magit-gerrit-ssh-creds nil
@@ -159,13 +160,32 @@ parameter of `magit-insert-section'."
     ;; (message (format "Using cmd: %s" gcmd))
     gcmd))
 
-(defun magit-gerrit--query (prj &optional status)
-  (magit-gerrit--command "query"
-                         "--format=JSON"
-                         "--current-patch-set"
-                         (concat "project:" prj)
-                         (concat magit-gerrit-extra-options)
-                         (concat "status:" (or status "open"))))
+;; https://gerrit-review.googlesource.com/Documentation/user-search.html
+;; For example we can set it to: "(status:open OR (status:merged AND -age:6months))"
+(defvar magit-gerrit-query-filters nil)
+(defvar magit-gerrit-query-filters-history nil)
+(add-to-list 'savehist-additional-variables 'magit-gerrit-query-filters-history)
+
+(defun magit-gerrit-edit-filters (arg)
+  "Edit the Gerrit query filters.
+Edit globally when called with universal argument."
+  (interactive "P")
+  (when-let* ((filters (read-string "Query filters: " nil 'magit-gerrit-query-filters-history))
+              ((not (string-empty-p filters))))
+    (kill-local-variable 'magit-gerrit-query-filters)
+    (if arg
+        (setq-default magit-gerrit-query-filters filters)
+      (setq-local magit-gerrit-query-filters filters))))
+
+(defun magit-gerrit--query (&optional prj status)
+  (when-let* ((prj (or prj (magit-gerrit-get-project))))
+    (magit-gerrit--command
+     "query"
+     "--format=JSON"
+     "--current-patch-set"
+     (concat "project:" prj)
+     magit-gerrit-extra-options
+     (or magit-gerrit-query-filters "status:open"))))
 
 (defun magit-gerrit--ssh-cmd (cmd &rest args)
   (apply #'call-process
@@ -517,10 +537,7 @@ Succeed even if branch already exist
   (magit-gerrit-copy-review t))
 
 (defun magit-gerrit-insert-reviews-section ()
-  (magit-gerrit-section
-   'gerrit-reviews
-   "Reviews:" 'magit-gerrit-wash-reviews
-   (magit-gerrit--query (magit-gerrit-get-project))))
+  (magit-gerrit-section 'gerrit-reviews "Reviews:" 'magit-gerrit-wash-reviews (magit-gerrit--query)))
 
 (defun magit-gerrit-add-reviewer ()
   "Add a reviewer to the review at point."
