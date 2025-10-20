@@ -185,7 +185,9 @@ Edit globally when called with universal argument."
      "--current-patch-set"
      (concat "project:" prj)
      magit-gerrit-extra-options
-     (or magit-gerrit-query-filters "status:open"))))
+     (if magit-gerrit-query-filters
+         (shell-quote-argument magit-gerrit-query-filters)
+       "status:open"))))
 
 (defun magit-gerrit--ssh-cmd (cmd &rest args)
   (apply #'call-process
