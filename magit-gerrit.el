@@ -90,6 +90,9 @@
 (defvar-local magit-gerrit-remote "origin"
   "Default remote name to use for gerrit (e.g. \"origin\", \"gerrit\").")
 
+(defvar magit-gerrit-fallback-remote "gerrit"
+  "Fallback remote name to use for gerrit.")
+
 (defvar-local magit-gerrit-force-enable nil
   "Force enabling `magit-gerrit' for the project.")
 
@@ -214,7 +217,10 @@ Edit globally when called with universal argument."
 
 (defun magit-gerrit-get-remote-url ()
   "Returns remote URL."
-  (magit-git-string (magit-gerrit-select-remote-url-cmd) magit-gerrit-remote))
+  (when-let* ((remote (cl-find-if (lambda (r) (member r (list magit-gerrit-remote magit-gerrit-fallback-remote)))
+                                  (magit-git-lines "remote"))))
+    (setq-local magit-gerrit-remote remote)
+    (magit-git-string (magit-gerrit-select-remote-url-cmd) remote)))
 
 (defun magit-gerrit-get-project ()
   (when-let* ((url (magit-gerrit-get-remote-url))
@@ -694,10 +700,10 @@ Succeed even if branch already exist
   :lighter " Gerrit" :require 'magit-topgit :keymap magit-gerrit-mode-map
   (unless (derived-mode-p 'magit-mode)
     (user-error "This mode only makes sense with magit"))
-  (unless magit-gerrit-ssh-creds
-    (user-error "You *must* set `magit-gerrit-ssh-creds' to enable magit-gerrit-mode"))
-  (unless (magit-gerrit-get-remote-url)
-    (user-error "You *must* set `magit-gerrit-remote' to a valid Gerrit remote"))
+  (if-let* ((url (magit-gerrit-get-remote-url)))
+      (unless (magit-gerrit-detect-ssh-creds url)
+        (user-error "You can set `magit-gerrit-ssh-creds' to enable magit-gerrit-mode"))
+    (user-error "You can set `magit-gerrit-remote' to a valid Gerrit remote"))
   (if magit-gerrit-mode
       (progn
         (magit-add-section-hook 'magit-status-sections-hook
@@ -716,13 +722,15 @@ Succeed even if branch already exist
 (defun magit-gerrit-detect-ssh-creds (remote-url)
   "Derive `magit-gerrit-ssh-creds' from REMOTE-URL.
 Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
-`magit-gerrit-port'."
-  (let ((url (url-generic-parse-url remote-url)))
-    (when (and (string= "ssh" (url-type url))
-               (eq magit-gerrit-port (url-port url)))
-      (set (make-local-variable 'magit-gerrit-ssh-creds)
-           (format "%s@%s" (url-user url) (url-host url)))
-      (message "Detected magit-gerrit-ssh-creds=%s" magit-gerrit-ssh-creds))))
+`magit-gerrit-port' or when `magit-gerrit-force-enable' is non-nil."
+  (prog1 (or magit-gerrit-ssh-creds
+             (when-let* ((url (url-generic-parse-url remote-url))
+                         (user (url-user url))
+                         (host (url-host url))
+                         ((and (string= "ssh" (url-type url))
+                               (or magit-gerrit-force-enable (eq magit-gerrit-port (url-port url))))))
+               (setq-local magit-gerrit-ssh-creds (format "%s@%s" user host))))
+    (message "Detected magit-gerrit-ssh-creds=%s" magit-gerrit-ssh-creds)))
 
 (defvar magit-gerrit--origin-action nil)
 (defvar magit-gerrit--dispatch-is-added nil)
@@ -731,7 +739,7 @@ Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
   (let ((remote-url (magit-gerrit-get-remote-url)))
     (when (and remote-url
                (or magit-gerrit-force-enable
-                   (and (or magit-gerrit-ssh-creds (magit-gerrit-detect-ssh-creds remote-url))
+                   (and (magit-gerrit-detect-ssh-creds remote-url)
                         (string-match magit-gerrit-ssh-creds remote-url))))
       (magit-gerrit-mode 1))
     (when (not magit-gerrit--origin-action)
