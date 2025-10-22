@@ -594,30 +594,27 @@ Succeed even if branch already exist
     (magit-refresh)))
 
 (defun magit-gerrit-push-review (status)
-  (when-let* ((branch (or (magit-get-current-branch)
-                          (error "Don't push a detached head.  That's gross")))
-              (commitid (or (magit-section-value-if 'commit)
-                            (error "Couldn't find a commit at point")))
-              (rev (magit-rev-parse (or commitid (error "Select a commit for review"))))
-              (branch-remote (and branch (magit-get "branch" branch "remote")))
-              (branch-merge (if (or (null branch-remote)
-                                    (string= branch-remote "."))
+  (let* ((branch (magit-get-current-branch))
+         (branch-remote (and branch (magit-get "branch" branch "remote")))
+         (branch-remote (and (not (or (null branch-remote) (string= branch-remote "."))) branch-remote)))
+    (when-let* (((or branch (y-or-n-p "Not on a branch, push a detached head? ")))
+                (commitid (or (magit-section-value-if 'commit) (error "Couldn't find a commit at point")))
+                (rev (magit-rev-parse (or commitid (error "Select a commit for review"))))
+                (branch-merge (if (and branch branch-remote)
+                                  (magit-get "branch" branch "merge")
                                 (completing-read
                                  "Remote Branch: "
                                  (let ((rbs (magit-list-remote-branch-names)))
-                                   (mapcar
-                                    (lambda (rb)
-                                      (and (string-match (rx bos (one-or-more (not (any "/"))) "/" (group (one-or-more any)) eos) rb)
-                                           (concat "refs/heads/" (match-string 1 rb))))
-                                    rbs)))
-                              (and branch (magit-get "branch" branch "merge"))))
-              (branch-pub (progn
-                            (string-match (rx "refs/heads" (group (one-or-more any))) branch-merge)
-                            (format "refs/%s%s" status (match-string 1 branch-merge)))))
-    (when (or (null branch-remote)
-              (string= branch-remote "."))
-      (setq branch-remote magit-gerrit-remote))
-    (magit-run-git-async "push" "-v" (when magit-gerrit-signed-push-p "--signed") branch-remote (concat rev ":" branch-pub))))
+                                   (or
+                                    (mapcar
+                                     (lambda (rb)
+                                       (and (string-match "^[^/]+/\\(.+\\)$" rb) (concat "refs/heads/" (match-string 1 rb))))
+                                     rbs)
+                                    '("refs/heads/master"))))))
+                (branch-pub (and (string-match "refs/heads\\(.+\\)" branch-merge)
+                                 (format "refs/%s%s" status (match-string 1 branch-merge)))))
+      (unless branch-remote (setq branch-remote magit-gerrit-remote))
+      (magit-run-git-async "push" "-v" (when magit-gerrit-signed-push-p "--signed") branch-remote (concat rev ":" branch-pub)))))
 
 (defun magit-gerrit-create-review ()
   (interactive)
