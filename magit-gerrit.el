@@ -173,7 +173,7 @@ parameter of `magit-insert-section'."
   "Edit the Gerrit query filters.
 Edit globally when called with universal argument."
   (interactive "P")
-  (when-let* ((filters (read-string "Query filters: " nil 'magit-gerrit-query-filters-history))
+  (when-let* ((filters (read-string "Query filters: " magit-gerrit-query-filters 'magit-gerrit-query-filters-history))
               ((not (string-empty-p filters))))
     (kill-local-variable 'magit-gerrit-query-filters)
     (if arg
