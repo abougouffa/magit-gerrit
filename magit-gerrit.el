@@ -744,7 +744,8 @@ Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
                          ((and (string= "ssh" (url-type url))
                                (or magit-gerrit-force-enable (eq magit-gerrit-port (url-port url))))))
                (setq-local magit-gerrit-ssh-creds (format "%s@%s" user host))))
-    (message "Detected magit-gerrit-ssh-creds=%s" magit-gerrit-ssh-creds)))
+    (let ((inhibit-message t))
+      (message "Detected magit-gerrit-ssh-creds=%s" magit-gerrit-ssh-creds))))
 
 (defvar magit-gerrit--origin-action nil)
 (defvar magit-gerrit--dispatch-is-added nil)
