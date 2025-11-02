@@ -519,8 +519,9 @@ Succeed even if branch already exist
 (defun magit-gerrit-browse-review ()
   "Browse the Gerrit Review with a browser."
   (interactive)
-  (when-let* ((jobj (magit-gerrit-review-at-point)))
-    (browse-url (cdr (assoc 'url jobj)))))
+  (if-let* ((jobj (magit-gerrit-review-at-point)))
+      (browse-url (cdr (assoc 'url jobj)))
+    (call-interactively #'magit-visit-thing)))
 
 (defun magit-gerrit-copy-review (with-commit-message)
   "Copy review url and commit message when WITH-COMMIT-MESSAGE is non-nil."
@@ -713,6 +714,22 @@ Succeed even if branch already exist
     (remove-hook 'magit-create-branch-command-hook 'magit-gerrit-create-branch t)
     (remove-hook 'magit-remote-update-command-hook 'magit-gerrit-remote-update t)
     (remove-hook 'magit-push-command-hook 'magit-gerrit-push t))
+  (when (not magit-gerrit--origin-action)
+    (setq magit-gerrit--origin-action (lookup-key magit-mode-map magit-gerrit-popup-prefix))
+    (if magit-gerrit-mode
+        (progn
+          ;; Update keymap with prefix incase it has changed
+          (define-key magit-mode-map magit-gerrit-popup-prefix 'magit-gerrit-dispatch)
+          (define-key magit-mode-map [remap magit-visit-thing] 'magit-gerrit-browse-review)
+          ;; Attach Magit Gerrit to Magit's default help popup
+          (when (not magit-gerrit--dispatch-is-added)
+            (transient-append-suffix 'magit-dispatch "z"
+              `(,magit-gerrit-popup-prefix "Gerrit" magit-gerrit-dispatch)))
+          (setq magit-gerrit--dispatch-is-added t))
+      (define-key magit-mode-map magit-gerrit-popup-prefix magit-gerrit--origin-action)
+      ;; Dettach Magit Gerrit to Magit's default help popup
+      (setq magit-gerrit--dispatch-is-added nil)
+      (transient-remove-suffix 'magit-dispatch magit-gerrit-popup-prefix)))
   (when (called-interactively-p 'any)
     (magit-refresh)))
 
@@ -738,23 +755,7 @@ Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
                (or magit-gerrit-force-enable
                    (and (magit-gerrit-detect-ssh-creds remote-url)
                         (string-match magit-gerrit-ssh-creds remote-url))))
-      (magit-gerrit-mode 1))
-    (when (not magit-gerrit--origin-action)
-      (setq magit-gerrit--origin-action (lookup-key magit-mode-map magit-gerrit-popup-prefix)))
-    (if magit-gerrit-mode
-        (progn
-          ;; Update keymap with prefix incase it has changed
-          (define-key magit-mode-map magit-gerrit-popup-prefix 'magit-gerrit-dispatch)
-          (define-key magit-mode-map [remap magit-visit-thing] 'magit-gerrit-browse-review)
-          ;; Attach Magit Gerrit to Magit's default help popup
-          (when (not magit-gerrit--dispatch-is-added)
-            (transient-append-suffix 'magit-dispatch "z"
-              `(,magit-gerrit-popup-prefix "Gerrit" magit-gerrit-dispatch)))
-          (setq magit-gerrit--dispatch-is-added t))
-      (define-key magit-mode-map magit-gerrit-popup-prefix magit-gerrit--origin-action)
-      ;; Dettach Magit Gerrit to Magit's default help popup
-      (setq magit-gerrit--dispatch-is-added nil)
-      (transient-remove-suffix 'magit-dispatch magit-gerrit-popup-prefix))))
+      (magit-gerrit-mode 1))))
 
 ;; Hack in dir-local variables that might be set for magit gerrit
 (add-hook 'magit-status-mode-hook #'hack-dir-local-variables-non-file-buffer t)
