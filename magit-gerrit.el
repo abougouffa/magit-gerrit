@@ -594,7 +594,20 @@ Succeed even if branch already exist
     (magit-fetch-all-no-prune)
     (magit-refresh)))
 
-(defun magit-gerrit-push-review (status)
+(defconst magit-gerrit-push-options
+  '((work-in-progress) (ready) (private) (remove-private) (publish-comments)
+    (hashtag . t) (topic . t) (message . t) (notify . (NONE OWNER OWNER_REVIEWERS ALL))))
+
+(defun magit-gerrit-read-push-option ()
+  (let* ((option (intern (completing-read "Select an option: " magit-gerrit-push-options nil t)))
+         (choice (alist-get option magit-gerrit-push-options))
+         (prompt (format "Value for option %S: " option))
+         (val
+          (cond ((eq choice t) (read-string prompt))
+                ((consp choice) (completing-read prompt choice nil t)))))
+    (concat "%" (format "%s" option) (when val (format "=%s" val)))))
+
+(defun magit-gerrit-push-review (status &optional option)
   (let* ((branch (magit-get-current-branch))
          (branch-remote (and branch (magit-get "branch" branch "remote")))
          (branch-remote (and (not (or (null branch-remote) (string= branch-remote "."))) branch-remote)))
@@ -615,15 +628,15 @@ Succeed even if branch already exist
                 (branch-pub (and (string-match "refs/heads\\(.+\\)" branch-merge)
                                  (format "refs/%s%s" status (match-string 1 branch-merge)))))
       (unless branch-remote (setq branch-remote magit-gerrit-remote))
-      (magit-run-git-async "push" "-v" (when magit-gerrit-signed-push-p "--signed") branch-remote (concat rev ":" branch-pub)))))
+      (magit-run-git-async "push" "-v" (when magit-gerrit-signed-push-p "--signed") branch-remote (concat rev ":" branch-pub option)))))
 
-(defun magit-gerrit-create-review ()
-  (interactive)
-  (magit-gerrit-push-review 'for))
+(defun magit-gerrit-create-review (&optional with-opt)
+  (interactive "P")
+  (magit-gerrit-push-review 'for (when with-opt (magit-gerrit-read-push-option))))
 
-(defun magit-gerrit-create-draft ()
-  (interactive)
-  (magit-gerrit-push-review 'drafts))
+(defun magit-gerrit-create-draft (&optional with-opt)
+  (interactive "P")
+  (magit-gerrit-push-review 'drafts (when with-opt (magit-gerrit-read-push-option))))
 
 (defun magit-gerrit-publish-draft ()
   (interactive)
