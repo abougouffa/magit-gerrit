@@ -603,26 +603,6 @@ Succeed even if branch already exist
   (interactive "P")
   (magit-gerrit-push-review 'drafts (when with-opt (magit-gerrit-read-push-option))))
 
-(defun magit-gerrit-publish-draft ()
-  (interactive)
-  (let ((prj (magit-gerrit-get-project))
-        (rev (cdr-safe (assoc
-                        'revision
-                        (cdr-safe (assoc 'currentPatchSet
-                                         (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--ssh-cmd "review" "--project" prj "--publish" rev))
-  (magit-refresh))
-
-(defun magit-gerrit-delete-draft ()
-  (interactive)
-  (let ((prj (magit-gerrit-get-project))
-        (rev (cdr-safe (assoc
-                        'revision
-                        (cdr-safe (assoc 'currentPatchSet
-                                         (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--ssh-cmd "review" "--project" prj "--delete" rev))
-  (magit-refresh))
-
 (defun magit-gerrit-abandon-review ()
   (interactive)
   (let ((prj (magit-gerrit-get-project))
@@ -662,8 +642,6 @@ Succeed even if branch already exist
     ("A" "Add reviewer"                    magit-gerrit-add-reviewer)
     ("B" "Abandon review"                  magit-gerrit-abandon-review)
     ("R" "Restore abandoned review"        magit-gerrit-restore-review)
-    ("k" "Delete draft"                    magit-gerrit-delete-draft)
-    ("p" "Publish draft patchset"          magit-gerrit-publish-draft)
     ("P" "Push commit for review"          magit-gerrit-push-for-review)
     ("S" "Submit review"                   magit-gerrit-submit-review)
     ("W" "Push commit for draft review"    magit-gerrit-push-draft-for-review)]
