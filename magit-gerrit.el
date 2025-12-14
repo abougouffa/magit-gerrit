@@ -261,46 +261,29 @@ Succeed even if branch already exist
 (defun magit-gerrit-pretty-print-review-header ()
   (let* ((wid (window-width))
          ;; number
-         (numstr (propertize (format "%-13s" "Patchset")))
-         ;; ;; patchset num
-         ;; (patchsetstr (propertize (format "%-5s" "Patchset")))
+         (numstr (format "%-13s" "Patchset"))
          ;; branch info
-         (branch (propertize (truncate-string-to-width
-                              "Branch"
-                              20
-                              nil ?\s)))
+         (branch (truncate-string-to-width "Branch" 20 nil ?\s))
          ;; sizeinfo
-         (sizeinfo (propertize (truncate-string-to-width
-                                (format "     %s" "Delta")
-                                15
-                                nil ?\s)))
+         (sizeinfo (truncate-string-to-width (format "     %s" "Delta") 15 nil ?\s))
          ;; owner
-         (author (propertize (truncate-string-to-width
-                              (format "%s" "Owner")
-                              10
-                              nil ?\s)))
+         (author (truncate-string-to-width (format "%s" "Owner") 10 nil ?\s))
          ;; lastupdate
-         (lastupdate (propertize (truncate-string-to-width
-                                  (format "%s" "Updated")
-                                  12
-                                  nil ?\s)))
+         (lastupdate (truncate-string-to-width (format "%s" "Updated") 12 nil ?\s))
          ;; approvals
          (approvals-info (magit-gerrit-create-review-labels))
-
          ;; subject
-         (subjstr (propertize
-                   (truncate-string-to-width
-                    (format "%s" "Subject")
-                    (- wid (length (concat numstr author
-                                           (cond
-                                            ((> wid 128) (concat branch sizeinfo lastupdate approvals-info))
-                                            ((> wid 108) (concat sizeinfo lastupdate approvals-info))
-                                            ((> wid 94)  (concat sizeinfo approvals-info))
-                                            ((> wid 80)  (concat approvals-info))
-                                            (t ""))))
-                       1)
-                    nil ?\s)))
-
+         (subjstr (truncate-string-to-width
+                   (format "%s" "Subject")
+                   (- wid (length (concat numstr author
+                                          (cond
+                                           ((> wid 128) (concat branch sizeinfo lastupdate approvals-info))
+                                           ((> wid 108) (concat sizeinfo lastupdate approvals-info))
+                                           ((> wid 94)  (concat sizeinfo approvals-info))
+                                           ((> wid 80)  (concat approvals-info))
+                                           (t ""))))
+                      1)
+                   nil ?\s))
          (show-str (concat numstr subjstr author
                            (cond
                             ((> wid 128) (concat branch sizeinfo lastupdate approvals-info))
@@ -318,35 +301,24 @@ Succeed even if branch already exist
          (patchsetstr (propertize (format "%-5s" (format "[%s]" patchsetn))
                                   'font-lock-face 'magit-hash))
          ;; branch info
-         (branch (propertize (truncate-string-to-width
-                              br
-                              20
-                              nil ?\s)
+         (branch (propertize (truncate-string-to-width br 20 nil ?\s)
                              'font-lock-face 'magit-hash))
          ;; sizeinfo
          (sizeinfo (concat (propertize (truncate-string-to-width
                                         (format "%+7s"  (concat "+" (number-to-string size-i)))
-                                        7
-                                        nil ?\s)
+                                        7 nil ?\s)
                                        'font-lock-face 'diff-added)
                            " "
-                           (propertize (truncate-string-to-width
-                                        (format "-%s" size-d)
-                                        7
-                                        nil ?\s)
+                           (propertize (truncate-string-to-width (format "-%s" size-d) 7 nil ?\s)
                                        'font-lock-face 'diff-removed)))
          ;; owner
-         (author (propertize (truncate-string-to-width
-                              (format "%s" owner-name)
-                              10
-                              nil ?\s)
+         (author (propertize (truncate-string-to-width (format "%s" owner-name) 10 nil ?\s)
                              'font-lock-face 'magit-log-author))
          ;; lastupdate
-         (lastupdate (propertize (truncate-string-to-width
-                                  (magit-gerrit-format-short-timestring
-                                   (time-to-seconds (time-since ctime)))
-                                  12
-                                  nil ?\s)))
+         (lastupdate (truncate-string-to-width
+                      (magit-gerrit-format-short-timestring
+                       (time-to-seconds (time-since ctime)))
+                      12 nil ?\s))
          ;; subject
          (subjstr (propertize
                    (truncate-string-to-width
