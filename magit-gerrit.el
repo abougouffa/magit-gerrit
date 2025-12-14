@@ -633,11 +633,14 @@ Succeed even if branch already exist
       (unless branch-remote (setq branch-remote magit-gerrit-remote))
       (magit-run-git-async "push" "-v" (when magit-gerrit-signed-push-p "--signed") branch-remote (concat rev ":" branch-pub option)))))
 
-(defun magit-gerrit-create-review (&optional with-opt)
+(define-obsolete-function-alias 'magit-gerrit-create-review 'magit-gerrit-push-for-review "1.0.0")
+(define-obsolete-function-alias 'magit-gerrit-create-draft 'magit-gerrit-push-draft-for-review "1.0.0")
+
+(defun magit-gerrit-push-for-review (&optional with-opt)
   (interactive "P")
   (magit-gerrit-push-review 'for (when with-opt (magit-gerrit-read-push-option))))
 
-(defun magit-gerrit-create-draft (&optional with-opt)
+(defun magit-gerrit-push-draft-for-review (&optional with-opt)
   (interactive "P")
   (magit-gerrit-push-review 'drafts (when with-opt (magit-gerrit-read-push-option))))
 
@@ -691,9 +694,9 @@ Succeed even if branch already exist
     ("B" "Abandon review"                  magit-gerrit-abandon-review)
     ("k" "Delete draft"                    magit-gerrit-delete-draft)
     ("p" "Publish draft patchset"          magit-gerrit-publish-draft)
-    ("P" "Push commit for review"          magit-gerrit-create-review)
+    ("P" "Push commit for review"          magit-gerrit-push-for-review)
     ("S" "Submit review"                   magit-gerrit-submit-review)
-    ("W" "Push commit for draft review"    magit-gerrit-create-draft)]
+    ("W" "Push commit for draft review"    magit-gerrit-push-draft-for-review)]
    ["Review"
     ("b" "Browse review"                   magit-gerrit-browse-review)
     ("C" "Code review"                     magit-gerrit-code-review)
