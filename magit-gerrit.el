@@ -112,8 +112,8 @@
   :group 'magit-gerrit
   :type 'list)
 
-(defcustom magit-gerrit-popup-prefix "R"
-  "Key code to open magit-gerrit popup."
+(defcustom magit-gerrit-popup-prefix "_"
+  "Key code to open magit-gerrit transient."
   :group 'magit-gerrit
   :type 'key-sequence)
 
