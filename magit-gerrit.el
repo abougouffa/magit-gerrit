@@ -641,7 +641,17 @@ Succeed even if branch already exist
     (magit-gerrit--review-abandon prj rev)
     (magit-refresh)))
 
-(defun magit-gerrit-read-comment (&rest _args)
+(defun magit-gerrit-restore-review ()
+  (interactive)
+  (let ((prj (magit-gerrit-get-project))
+        (rev (cdr-safe (assoc
+                        'revision
+                        (cdr-safe (assoc 'currentPatchSet
+                                         (magit-gerrit-review-at-point)))))))
+    (magit-gerrit--review-restore prj rev)
+    (magit-refresh)))
+
+(defun magit-gerrit-read-message (&rest _args)
   (format "\'%s\'" (read-from-minibuffer "Message: ")))
 
 (transient-define-argument magit-gerrit--transient-arg-message ()
@@ -649,7 +659,7 @@ Succeed even if branch already exist
   :class 'transient-option
   :key "-m"
   :argument "--message "
-  :reader 'magit-gerrit-read-comment)
+  :reader 'magit-gerrit-read-message)
 
 ;;;###autoload (autoload 'magit-gerrit-dispatch "magit-gerrit" nil t)
 (transient-define-prefix magit-gerrit-dispatch ()
@@ -659,6 +669,7 @@ Succeed even if branch already exist
   [["Actions"
     ("A" "Add reviewer"                    magit-gerrit-add-reviewer)
     ("B" "Abandon review"                  magit-gerrit-abandon-review)
+    ("R" "Restore abandoned review"        magit-gerrit-restore-review)
     ("k" "Delete draft"                    magit-gerrit-delete-draft)
     ("p" "Publish draft patchset"          magit-gerrit-publish-draft)
     ("P" "Push commit for review"          magit-gerrit-push-for-review)
