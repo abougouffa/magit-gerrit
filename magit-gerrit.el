@@ -188,14 +188,6 @@ Edit globally when called with universal argument."
          "ssh" nil nil nil
          (split-string (apply #'magit-gerrit--command cmd args))))
 
-(defun magit-gerrit--review-abandon (prj rev)
-  "Abandon change REV on PRJ."
-  (magit-gerrit--ssh-cmd "review" "--project" prj "--abandon" rev))
-
-(defun magit-gerrit--review-restore (prj rev)
-  "Restore abandonned change REV on PRJ."
-  (magit-gerrit--ssh-cmd "review" "--project" prj "--restore" rev))
-
 (defun magit-gerrit--review-submit (prj rev &optional msg)
   "Submit change REV for merging on PRJ with optional message MSG."
   (magit-gerrit--ssh-cmd "review" "--project" prj "--submit" (or msg "") rev))
@@ -638,7 +630,7 @@ Succeed even if branch already exist
                         'revision
                         (cdr-safe (assoc 'currentPatchSet
                                          (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--review-abandon prj rev)
+    (magit-gerrit--ssh-cmd "review" "--project" prj "--abandon" rev)
     (magit-refresh)))
 
 (defun magit-gerrit-restore-review ()
@@ -648,7 +640,7 @@ Succeed even if branch already exist
                         'revision
                         (cdr-safe (assoc 'currentPatchSet
                                          (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--review-restore prj rev)
+    (magit-gerrit--ssh-cmd "review" "--project" prj "--restore" rev)
     (magit-refresh)))
 
 (defun magit-gerrit-read-message (&rest _args)
