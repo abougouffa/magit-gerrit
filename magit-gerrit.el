@@ -209,18 +209,16 @@ Edit globally when called with universal argument."
 (defun magit-gerrit--review-verify (prj rev score &optional msg)
   (magit-gerrit--ssh-cmd "review" "--project" prj "--verified" score (or msg "") rev))
 
-(defun magit-gerrit-select-remote-url-cmd ()
-  "Returns git command to be used to resolve remote URL."
-  (if magit-gerrit-use-push-url
-      (list "remote" "get-url" "--push")
-    (list "ls-remote" "--get-url")))
-
 (defun magit-gerrit-get-remote-url ()
   "Returns remote URL."
   (when-let* ((remote (cl-find-if (lambda (r) (member r (list magit-gerrit-remote magit-gerrit-fallback-remote)))
                                   (magit-git-lines "remote"))))
     (setq-local magit-gerrit-remote remote)
-    (magit-git-string (magit-gerrit-select-remote-url-cmd) remote)))
+    (magit-git-string
+     (if magit-gerrit-use-push-url
+         '("remote" "get-url" "--push")
+       '("ls-remote" "--get-url"))
+     remote)))
 
 (defun magit-gerrit-get-project ()
   (when-let* ((url (magit-gerrit-get-remote-url))
