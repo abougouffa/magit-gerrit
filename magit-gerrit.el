@@ -104,11 +104,6 @@
   :group 'magit-gerrit
   :type 'boolean)
 
-(defcustom magit-gerrit-show-review-labels nil
-  "If t show Gerrit Review Labels as 1st row."
-  :group 'magit-gerrit
-  :type 'boolean)
-
 (defconst magit-gerrit-default-review-labels
   (list (list "Code-Review" "CR") (list "Verified" "Ve")))
 
@@ -160,12 +155,11 @@ parameter of `magit-insert-section'."
                cmd
                " "
                (mapconcat 'identity args " "))))
-    ;; (message (format "Using cmd: %s" gcmd))
     gcmd))
 
 ;; https://gerrit-review.googlesource.com/Documentation/user-search.html
 ;; For example we can set it to: "(status:open OR (status:merged AND -age:6months))"
-(defvar magit-gerrit-query-filters nil)
+(defvar-local magit-gerrit-query-filters nil)
 (defvar magit-gerrit-query-filters-history nil)
 (add-to-list 'savehist-additional-variables 'magit-gerrit-query-filters-history)
 
@@ -180,7 +174,8 @@ Edit globally when called with universal argument."
         (setq-default magit-gerrit-query-filters filters)
       (setq-local magit-gerrit-query-filters filters))))
 
-(defun magit-gerrit--query (&optional prj status)
+(defun magit-gerrit--query (&optional prj)
+  "Query project PRJ using `magit-gerrit-query-filters' or `status:open'."
   (when-let* ((prj (or prj (magit-gerrit-get-project))))
     (magit-gerrit--command
      "query"
@@ -193,20 +188,29 @@ Edit globally when called with universal argument."
        "status:open"))))
 
 (defun magit-gerrit--ssh-cmd (cmd &rest args)
+  "Call Gerrit's command CMD with ARGS via SSH."
   (apply #'call-process
          "ssh" nil nil nil
          (split-string (apply #'magit-gerrit--command cmd args))))
 
 (defun magit-gerrit--review-abandon (prj rev)
+  "Abandon change REV on PRJ."
   (magit-gerrit--ssh-cmd "review" "--project" prj "--abandon" rev))
 
+(defun magit-gerrit--review-restore (prj rev)
+  "Restore abandonned change REV on PRJ."
+  (magit-gerrit--ssh-cmd "review" "--project" prj "--restore" rev))
+
 (defun magit-gerrit--review-submit (prj rev &optional msg)
+  "Submit change REV for merging on PRJ with optional message MSG."
   (magit-gerrit--ssh-cmd "review" "--project" prj "--submit" (or msg "") rev))
 
 (defun magit-gerrit--code-review (prj rev score &optional msg)
+  "Set code-review SCORE for REV on PRJ, with optional MSG."
   (magit-gerrit--ssh-cmd "review" "--project" prj "--code-review" score (or msg "") rev))
 
 (defun magit-gerrit--review-verify (prj rev score &optional msg)
+  "Set verified SCORE for REV on PRJ, with optional MSG."
   (magit-gerrit--ssh-cmd "review" "--project" prj "--verified" score (or msg "") rev))
 
 (defun magit-gerrit-get-remote-url ()
@@ -221,6 +225,7 @@ Edit globally when called with universal argument."
      remote)))
 
 (defun magit-gerrit-get-project ()
+  "Get the Gerrit project name for the current repo."
   (when-let* ((url (magit-gerrit-get-remote-url))
               (url (url-generic-parse-url url))
               (prj (url-filename url)))
