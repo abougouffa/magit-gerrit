@@ -557,7 +557,7 @@ Succeed even if branch already exist
     (magit-refresh)))
 
 (defconst magit-gerrit-push-options
-  '((work-in-progress) (ready) (private) (remove-private) (publish-comments)
+  '((wip) (ready) (private) (remove-private) (publish-comments)
     (hashtag . t) (topic . t) (message . t) (notify . (NONE OWNER OWNER_REVIEWERS ALL))))
 
 (defun magit-gerrit-read-push-option ()
