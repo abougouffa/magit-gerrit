@@ -1,6 +1,6 @@
 ;;; magit-gerrit.el --- Magit plugin for Gerrit Code Review  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2013-2025 Brian Fransioli
+;; Copyright (C) 2013-2026 Brian Fransioli
 
 ;; Author: Brian Fransioli <assem@terranpro.org>
 ;; Author: Abdelhak Bougouffa
@@ -125,7 +125,7 @@
 (defcustom magit-gerrit-extra-options nil
   "Extra options defined when fetching reviews."
   :group 'magit-gerrit
-  :type 'string)
+  :type '(repeat string))
 
 (defcustom magit-gerrit-collapse-patchset-section nil
   "Collapse/hide gerrit section containing patchsets by default.
@@ -139,18 +139,14 @@ parameter of `magit-insert-section'."
   :type 'boolean)
 
 (defun magit-gerrit--command (cmd &rest args)
-  (let ((gcmd (concat
-               "-x -p "
-               (number-to-string magit-gerrit-port)
-               " "
-               (or magit-gerrit-ssh-creds
-                   (error "`magit-gerrit-ssh-creds' must be set!"))
-               " "
-               "gerrit "
-               cmd
-               " "
-               (mapconcat 'identity args " "))))
-    gcmd))
+  "Build SSH parameters to run Gerrit's CMD with ARGS."
+  `("-x" "-p"
+    ,(number-to-string magit-gerrit-port)
+    ,(or magit-gerrit-ssh-creds
+         (error "`magit-gerrit-ssh-creds' must be set!"))
+    "gerrit"
+    ,cmd
+    ,@(seq-filter #'identity (flatten-list args))))
 
 ;; https://gerrit-review.googlesource.com/Documentation/user-search.html
 ;; For example we can set it to: "(status:open OR (status:merged AND -age:6months))"
@@ -186,7 +182,7 @@ Edit globally when called with universal argument."
   "Call Gerrit's command CMD with ARGS via SSH."
   (apply #'call-process
          "ssh" nil nil nil
-         (split-string (apply #'magit-gerrit--command cmd args))))
+         (apply #'magit-gerrit--command cmd args)))
 
 (defun magit-gerrit--review-submit (prj rev &optional msg)
   "Submit change REV for merging on PRJ with optional message MSG."
@@ -508,7 +504,7 @@ Succeed even if branch already exist
   (magit-gerrit-copy-review t))
 
 (defun magit-gerrit-insert-reviews-section ()
-  (magit-gerrit-section 'gerrit-reviews "Reviews:" 'magit-gerrit-wash-reviews (magit-gerrit--query)))
+  (magit-gerrit-section 'gerrit-reviews "Reviews:" 'magit-gerrit-wash-reviews (string-join (magit-gerrit--query) " ")))
 
 (defun magit-gerrit-add-reviewer ()
   "Add a reviewer to the review at point."
