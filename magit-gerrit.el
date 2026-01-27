@@ -5,7 +5,7 @@
 ;; Author: Brian Fransioli <assem@terranpro.org>
 ;; Author: Abdelhak Bougouffa
 ;; URL: https://github.com/terranpro/magit-gerrit
-;; Package-Requires: ((emacs "28.1") (magit "3.3.0") (transient "0.3.0"))
+;; Package-Requires: ((emacs "29.1") (magit "3.3.0") (transient "0.3.0"))
 ;; Package-Version: 0.1.0
 
 ;; This program is free software; you can redistribute it and/or
@@ -434,45 +434,51 @@ Succeed even if branch already exist
   (while (and magit-this-process (eq (process-status magit-this-process) 'run))
     (sleep-for 0.005)))
 
-(defun magit-gerrit-fetch-patchset (&optional ref)
-  "Fetch a Gerrit review patchset at REF."
-  (when-let* ((ref (or ref
-                       (when-let* ((jobj (magit-gerrit-review-at-point)))
-                         (cdr (assoc 'ref (assoc 'currentPatchSet jobj)))))))
+(defun magit-gerrit-get-ref (&optional select-number)
+  (when-let* ((jobj (magit-gerrit-review-at-point))
+              (curr-patchset (assoc 'currentPatchSet jobj))
+              (ref (cdr (assoc 'ref curr-patchset)))
+              (number (cdr (assoc 'number curr-patchset))))
+    (if select-number
+        (concat (string-join
+                 (append (butlast (string-split ref "/"))
+                         (list (number-to-string (read-number (format "Select patch number (up to %d): " number)))))
+                 "/"))
+      ref)))
+
+(defun magit-gerrit-fetch-patchset (&optional ref select-number)
+  "Fetch a Gerrit review patchset at REF, optionally SELECT-NUMBER."
+  (when-let* ((ref (or ref (magit-gerrit-get-ref select-number))))
     (magit-git-fetch magit-gerrit-remote ref)
     (message (format "Waiting a git fetch from %s to complete..." magit-gerrit-remote))
     (magit-gerrit-process-wait)))
 
-(defun magit-gerrit-view-patchset-diff ()
-  "View the diff for a patchset."
-  (interactive)
-  (when-let* ((jobj (magit-gerrit-review-at-point)))
-    (let ((ref (cdr (assoc 'ref (assoc 'currentPatchSet jobj))))
-          (dir default-directory))
+(defun magit-gerrit-view-patchset-diff (&optional select-number)
+  "View the diff for a patchset, optionally SELECT-NUMBER."
+  (interactive "P")
+  (when-let* ((ref (magit-gerrit-get-ref select-number)))
+    (let ((dir default-directory))
       (magit-gerrit-fetch-patchset ref)
       (message (format "Generating Gerrit Patchset for refs %s dir %s" ref dir))
       (magit-diff-range "FETCH_HEAD~1..FETCH_HEAD"))))
 
-(defun magit-gerrit-download-patchset ()
-  "Download a Gerrit review patchset."
-  (interactive)
-  (when-let* ((jobj (magit-gerrit-review-at-point)))
-    (let ((ref (cdr (assoc 'ref (assoc 'currentPatchSet jobj))))
-          (dir default-directory)
-          (branch (format "review/%s/%s-%s"
-                          (cdr (assoc 'username (assoc 'owner jobj)))
-                          (cdr (or (assoc 'topic jobj) (assoc 'number jobj)))
-                          (cdr-safe (assoc 'number (cdr-safe (assoc 'currentPatchSet jobj)))))))
+(defun magit-gerrit-download-patchset (&optional select-number)
+  "Download a Gerrit review patchset, optionally SELECT-NUMBER."
+  (interactive "P")
+  (when-let* ((jobj (magit-gerrit-review-at-point))
+              (ref (magit-gerrit-get-ref select-number)))
+    (let* ((dir default-directory)
+           (num (string-join (last (string-split ref "/") 2) "/"))
+           (branch (format "review/%s/%s%s" (alist-get 'username (assoc 'owner jobj)) (if-let* ((topic (alist-get 'topic jobj))) (concat topic "-") "") num)))
       (magit-gerrit-fetch-patchset ref)
       (message (format "Checking out refs %s to %s in %s" ref branch dir))
       (magit-gerrit-create-branch-force branch "FETCH_HEAD"))))
 
-(defun magit-gerrit-cherry-pick-patchset ()
-  "Cherry-pick a Gerrit review patchset."
-  (interactive)
-  (when-let* ((jobj (magit-gerrit-review-at-point)))
-    (magit-gerrit-fetch-patchset)
-    (magit--cherry-pick '("FETCH_HEAD") nil)))
+(defun magit-gerrit-cherry-pick-patchset (&optional select-number)
+  "Cherry-pick a Gerrit review patchset, optionally SELECT-NUMBER."
+  (interactive "P")
+  (magit-gerrit-fetch-patchset nil select-number)
+  (magit--cherry-pick '("FETCH_HEAD") nil))
 
 (defun magit-gerrit-browse-review ()
   "Browse the Gerrit Review with a browser."
@@ -499,7 +505,7 @@ Succeed even if branch already exist
   (magit-gerrit-copy-review nil))
 
 (defun magit-gerrit-copy-review-url-commit-message ()
-  "Copy review url with commit message"
+  "Copy review url with commit message."
   (interactive)
   (magit-gerrit-copy-review t))
 
