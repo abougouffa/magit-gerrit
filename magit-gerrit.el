@@ -184,6 +184,46 @@ Edit globally when called with universal argument."
          "ssh" nil nil nil
          (apply #'magit-gerrit--command cmd args)))
 
+(defvar magit-gerrit--rev-change-id-cache (make-hash-table :test #'equal))
+
+(defun magit-gerrit-commit-change-id (&optional rev)
+  "Return Change-Id for REV or the commit at point."
+  (when-let* ((rev (or rev (magit-commit-at-point)))
+              (rev (substring rev 0 7)))
+    (if-let* ((id (gethash rev magit-gerrit--rev-change-id-cache)))
+        id
+      (when-let* ((id (magit-git-string "show" "--format=%(trailers:key=Change-Id,valueonly)" rev)))
+        (puthash rev id magit-gerrit--rev-change-id-cache)
+        id))))
+
+(defvar magit-gerrit--change-id-cache (make-hash-table :test #'equal))
+
+(defun magit-gerrit--get-change-id-info (id &optional invalidate-cache)
+  "Return information about Change-Id ID.
+
+When INVALIDATE-CACHE is non-nil, don't used cached values."
+  (if-let* ((cached (and (not invalidate-cache) (gethash id magit-gerrit--change-id-cache))))
+      cached
+    (let* ((magit-gerrit-query-filters (concat "change:" id))
+           (out (shell-command-to-string (string-join (cons "ssh" (magit-gerrit--query)) " ")))
+           vals)
+      (with-temp-buffer
+        (insert out)
+        (goto-char (point-min))
+        (while-let ((jobj (ignore-errors (json-read))))
+          (push jobj vals))
+        (puthash id vals magit-gerrit--change-id-cache))
+      vals)))
+
+(defun magit-gerrit-change-id-browse-url (&optional id)
+  "Go to the change ID's Gerrit URL."
+  (interactive (list (magit-gerrit-commit-change-id)))
+  (when-let* ((vals (magit-gerrit--get-change-id-info id))
+              (vals (seq-filter #'identity (mapcar (apply-partially #'alist-get 'url) vals))))
+    (browse-url (if (length= vals 1)
+                    (car vals)
+                  (completing-read "Select URL: " vals)))))
+
 (defun magit-gerrit--review-submit (prj rev &optional msg)
   "Submit change REV for merging on PRJ with optional message MSG."
   (magit-gerrit--ssh-cmd "review" "--project" prj "--submit" (or msg "") rev))
