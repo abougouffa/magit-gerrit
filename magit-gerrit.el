@@ -104,6 +104,11 @@
   :group 'magit-gerrit
   :type 'boolean)
 
+(defcustom magit-gerrit-gitiles-base-url nil
+  "The base URL for Gitiles."
+  :group 'magit-gerrit
+  :type '(choice (const nil) string))
+
 (defconst magit-gerrit-default-review-labels
   (list (list "Code-Review" "CR") (list "Verified" "Ve")))
 
@@ -223,6 +228,26 @@ When INVALIDATE-CACHE is non-nil, don't used cached values."
     (browse-url (if (length= vals 1)
                     (car vals)
                   (completing-read "Select URL: " vals)))))
+
+(defun magit-gerrit--get-gitiles-link (&optional line-number)
+  "Get Gitiles link, optionally with LINE-NUMBER."
+  (when-let* ((proj (magit-gerrit-get-project))
+              (base-url (or magit-gerrit-gitiles-base-url
+                            (when-let* ((push-url (magit-gerrit-get-remote-url))
+                                        (url (url-generic-parse-url push-url)))
+                              (concat "https://" (url-host url) "/plugins/gitiles"))))
+              (gerrit-proj (magit-gerrit-get-project))
+              (branch "master")
+              (proj (project-current))
+              (file-name (buffer-file-name))
+              (file-name (file-relative-name file-name (project-root proj))))
+    (concat base-url "/" gerrit-proj "/+/refs/heads/" branch "/" file-name (when line-number (format "#%d" line-number)))))
+
+(defun magit-gerrit-gitiles-browse-url (with-line-p)
+  "Brwose this file in Gitiles, highlight current line when WITH-LINE-P."
+  (interactive "P")
+  (when-let* ((url (magit-gerrit--get-gitiles-link (when with-line-p (line-number-at-pos (point))))))
+    (browse-url url)))
 
 (defun magit-gerrit--review-submit (prj rev &optional msg)
   "Submit change REV for merging on PRJ with optional message MSG."
