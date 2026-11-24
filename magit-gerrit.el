@@ -84,6 +84,7 @@
 (require 'mule-util)
 (require 'savehist)
 (require 'cl-lib)
+(require 'url)
 
 
 ;;; Customization
@@ -103,6 +104,33 @@ Otherwise, the fetch URL is used (see \"git remote get-url\")."
   "The SSH program used to run Gerrit commands."
   :group 'magit-gerrit
   :type 'string)
+
+(defcustom magit-gerrit-scp-program "scp"
+  "The scp program used to download the commit-msg hook."
+  :group 'magit-gerrit
+  :type 'string)
+
+(defcustom magit-gerrit-web-url nil
+  "The base URL of the Gerrit web interface (e.g. \"https://host/r\").
+When nil, it is deduced from the URL of a change of the project, or
+from the host of the remote as \"https://HOST\"."
+  :group 'magit-gerrit
+  :type '(choice (const :tag "Deduce" nil) string))
+(put 'magit-gerrit-web-url 'safe-local-variable #'stringp)
+
+(defcustom magit-gerrit-commit-msg-hook-methods '(https scp)
+  "Methods tried, in order, to download Gerrit's commit-msg hook.
+`https' downloads it from the web interface (see
+`magit-gerrit-web-url'), `scp' from the SSH daemon (with the legacy
+scp protocol, Gerrit doesn't support SFTP)."
+  :group 'magit-gerrit
+  :type '(repeat (choice (const https) (const scp))))
+
+(defcustom magit-gerrit-check-change-id t
+  "Whether to check that a commit has a Change-Id before pushing it.
+When it has none, offer to install the commit-msg hook if missing."
+  :group 'magit-gerrit
+  :type 'boolean)
 
 (defcustom magit-gerrit-gitiles-base-url nil
   "The base URL for Gitiles.
@@ -1257,6 +1285,103 @@ submit the change after voting."
   (magit-refresh))
 
 
+;;; Commit-msg hook
+
+(defun magit-gerrit--web-url ()
+  "Return the base URL of the Gerrit web interface.
+See `magit-gerrit-web-url'."
+  (or magit-gerrit-web-url
+      (when-let* ((project (magit-gerrit-get-project))
+                  (change (car (ignore-errors
+                                 (magit-gerrit--query-changes
+                                  (list (concat "project:" project) "limit:1")))))
+                  (url (magit-gerrit-change-url change))
+                  ((string-match "\\`\\(.*?\\)\\(?:/c/.*\\|/[0-9]+/?\\)\\'" url)))
+        (match-string 1 url))
+      (when-let* ((remote-url (magit-gerrit-get-remote-url))
+                  (host (url-host (url-generic-parse-url remote-url))))
+        (concat "https://" host))))
+
+(defun magit-gerrit--commit-msg-hook-file ()
+  "Return the path of the commit-msg hook of the current repository."
+  (let ((default-directory (or (magit-toplevel) default-directory)))
+    (expand-file-name (magit-git-string "rev-parse" "--git-path" "hooks/commit-msg"))))
+
+(defun magit-gerrit--download-hook-https (file)
+  "Download the commit-msg hook from the web interface to FILE.
+Return non-nil on success."
+  (let* ((url (concat (string-trim-right (magit-gerrit--web-url) "/") "/tools/hooks/commit-msg"))
+         (buffer (ignore-errors (url-retrieve-synchronously url t t 30))))
+    (when buffer
+      (unwind-protect
+          (with-current-buffer buffer
+            (goto-char (point-min))
+            (when (and (looking-at "HTTP/[0-9.]+ 200")
+                       (re-search-forward "\r?\n\r?\n" nil t)
+                       (looking-at "#!"))
+              (let ((coding-system-for-write 'no-conversion))
+                (write-region (point) (point-max) file nil 'silent))
+              (magit-gerrit--log (list "GET" url) 0 "")
+              t))
+        (kill-buffer buffer)))))
+
+(defun magit-gerrit--download-hook-scp (file)
+  "Download the commit-msg hook from the SSH daemon to FILE.
+Return non-nil on success."
+  (let ((tmp (make-temp-file "magit-gerrit-hook-"))
+        (default-directory temporary-file-directory))
+    (unwind-protect
+        (when (seq-some
+               (lambda (legacy)
+                 (let ((args (append (when legacy '("-O"))
+                                     (list "-P" (number-to-string magit-gerrit-port)
+                                           (concat magit-gerrit-ssh-creds ":hooks/commit-msg")
+                                           tmp))))
+                   (let ((exit-code (apply #'call-process magit-gerrit-scp-program nil nil nil args)))
+                     (magit-gerrit--log (cons magit-gerrit-scp-program args) exit-code "")
+                     (eq exit-code 0))))
+               ;; "-O" (legacy scp protocol) is needed since OpenSSH 9, but older
+               ;; versions don't know it
+               '(t nil))
+          (copy-file tmp file t)
+          t)
+      (delete-file tmp))))
+
+(defun magit-gerrit-install-commit-msg-hook (&optional force)
+  "Install Gerrit's commit-msg hook, generating the Change-Id of commits.
+Ask before replacing an existing hook, unless FORCE is non-nil.  The
+methods of `magit-gerrit-commit-msg-hook-methods' are tried in order."
+  (interactive)
+  (magit-gerrit-get-remote-url)
+  (let ((file (magit-gerrit--commit-msg-hook-file)))
+    (when (or force (not (file-exists-p file))
+              (y-or-n-p (format "Replace the existing %s? " file)))
+      (make-directory (file-name-directory file) t)
+      (if (seq-some (lambda (method)
+                      (pcase method
+                        ('https (magit-gerrit--download-hook-https file))
+                        ('scp (magit-gerrit--download-hook-scp file))))
+                    magit-gerrit-commit-msg-hook-methods)
+          (progn (set-file-modes file #o755)
+                 (message "Installed the commit-msg hook in %s" file)
+                 file)
+        (user-error "Cannot download the commit-msg hook, see %s" magit-gerrit-log-buffer-name)))))
+
+(defun magit-gerrit--check-change-id (rev)
+  "Check that REV has a Change-Id before pushing it, return nil to abort.
+When it has none and the commit-msg hook isn't installed, offer to
+install it."
+  (or (not magit-gerrit-check-change-id)
+      (magit-gerrit-commit-change-id rev)
+      (if (file-exists-p (magit-gerrit--commit-msg-hook-file))
+          (y-or-n-p "The commit has no Change-Id, push anyway? ")
+        (if (y-or-n-p "The commit has no Change-Id and the commit-msg hook isn't installed, install it? ")
+            (progn (magit-gerrit-install-commit-msg-hook t)
+                   (message "Hook installed, amend the commit to add a Change-Id, then push")
+                   nil)
+          (y-or-n-p "Push anyway? ")))))
+
+
 ;;; Push
 
 (defun magit-gerrit--account-candidates ()
@@ -1347,9 +1472,10 @@ of the current branch or read from the minibuffer."
          (branch (or (transient-arg-value "--branch=" args)
                      (magit-gerrit--default-target-branch)
                      (magit-gerrit--read-target-branch "Target branch: "))))
-    (magit-run-git-async "push" "-v" (when (member "--signed" args) "--signed")
-                         magit-gerrit-remote
-                         (magit-gerrit--push-refspec rev branch args))))
+    (when (magit-gerrit--check-change-id rev)
+      (magit-run-git-async "push" "-v" (when (member "--signed" args) "--signed")
+                           magit-gerrit-remote
+                           (magit-gerrit--push-refspec rev branch args)))))
 
 (defun magit-gerrit-push-wip-for-review (args)
   "Push the commit at point (or HEAD) as work in progress, using ARGS."
@@ -1828,7 +1954,8 @@ Interactively, show the change at point or read its number."
     ("F" "Cherry-pick"                     magit-gerrit-cherry-pick-patchset)]]
   [["Others"
     ("P" "Push for review"                 magit-gerrit-push)
-    ("/" "Query"                           magit-gerrit-query)]
+    ("/" "Query"                           magit-gerrit-query)
+    ("H" "Install commit-msg hook"         magit-gerrit-install-commit-msg-hook)]
    ["Commit at point"
     ("o" "Show its change"                 magit-gerrit-show-commit-change)
     ("O" "Browse its change"               magit-gerrit-browse-commit)]
