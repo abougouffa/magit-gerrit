@@ -794,7 +794,7 @@ Edit globally when called with universal argument ARG."
      (concat (when with-commit-message
                (format "%s: %s | "
                        (magit-gerrit-change-number change)
-                       (car (split-string (magit-gerrit-change-commit-message change) "\n" t))))
+                       (magit-gerrit-change-subject change)))
              (magit-gerrit-change-url change)))))
 
 (defun magit-gerrit-copy-review-url ()
