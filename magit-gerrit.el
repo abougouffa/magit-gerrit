@@ -182,6 +182,31 @@ and `magit-gerrit-save-query'."
   :group 'magit-gerrit
   :type '(alist :key-type (string :tag "Name") :value-type (string :tag "Query")))
 
+(defcustom magit-gerrit-show-revision-change t
+  "Whether to show the Gerrit change of a commit in revision buffers.
+This applies to buffers where `magit-gerrit-mode' is enabled (see
+`magit-gerrit-auto-enable')."
+  :group 'magit-gerrit
+  :type 'boolean)
+
+(defcustom magit-gerrit-annotate-log nil
+  "Whether to annotate the commits of log buffers with their Gerrit change.
+This applies to buffers where `magit-gerrit-mode' is enabled (see
+`magit-gerrit-auto-enable').  It costs a Gerrit query per refresh for
+the commits whose change isn't cached yet."
+  :group 'magit-gerrit
+  :type 'boolean)
+
+(defcustom magit-gerrit-annotate-log-max 100
+  "Maximum number of commits annotated in a log buffer."
+  :group 'magit-gerrit
+  :type 'integer)
+
+(defcustom magit-gerrit-change-cache-ttl 300
+  "Number of seconds the changes found by Change-Id are cached."
+  :group 'magit-gerrit
+  :type 'integer)
+
 (defcustom magit-gerrit-collapse-patchset-section nil
   "Collapse/hide gerrit section containing patchsets by default.
 Collapse/hide the section body containing the list of gerrit
@@ -596,18 +621,76 @@ When the commit has multiple Change-Id trailers, return the first one."
                     ((not (string-empty-p id))))
           (puthash hash id magit-gerrit--rev-change-id-cache)))))
 
-(defun magit-gerrit--get-change-id-info (id &optional invalidate-cache)
-  "Return information about Change-Id ID.
+(defun magit-gerrit--cached-change-id-info (id)
+  "Return the cache entry of Change-Id ID as (FOUND . LIST).
+LIST holds the changes found for ID.  FOUND is nil when ID isn't
+cached or the cache entry expired."
+  (when-let* ((entry (gethash id magit-gerrit--change-id-cache))
+              ((< (float-time (time-since (car entry))) magit-gerrit-change-cache-ttl)))
+    (cons t (cdr entry))))
 
-When INVALIDATE-CACHE is non-nil, don't used cached values."
-  (if-let* ((cached (and (not invalidate-cache) (gethash id magit-gerrit--change-id-cache))))
-      cached
-    (puthash id
-             (magit-gerrit--query-changes
-              (list (concat "project:" (magit-gerrit-get-project))
-                    (concat "change:" id))
-              "--current-patch-set")
-             magit-gerrit--change-id-cache)))
+(defun magit-gerrit--get-change-ids-info (ids &optional invalidate-cache)
+  "Look up the Change-Ids IDS, return an alist (ID . LIST).
+LIST holds the changes found for ID.
+The changes not in the cache are fetched with a single query.  When
+INVALIDATE-CACHE is non-nil, don't use cached values."
+  (let* ((ids (seq-uniq ids))
+         (missing (if invalidate-cache
+                      ids
+                    (seq-remove #'magit-gerrit--cached-change-id-info ids))))
+    (when missing
+      (let ((changes (magit-gerrit--query-changes
+                      (list (concat "project:" (magit-gerrit-get-project))
+                            (concat "(" (mapconcat (lambda (id) (concat "change:" id))
+                                                   missing " OR ")
+                                    ")"))
+                      "--current-patch-set"))
+            (now (current-time)))
+        (dolist (id missing)
+          (puthash id
+                   (cons now (seq-filter (lambda (c) (equal (magit-gerrit-change-id c) id))
+                                         changes))
+                   magit-gerrit--change-id-cache))))
+    (mapcar (lambda (id) (cons id (cdr (gethash id magit-gerrit--change-id-cache))))
+            ids)))
+
+(defun magit-gerrit--get-change-id-info (id &optional invalidate-cache)
+  "Look up the Change-Id ID, return what Gerrit found for it.
+There is one change per branch the commit was cherry-picked to.
+When INVALIDATE-CACHE is non-nil, don't use cached values."
+  (cdar (magit-gerrit--get-change-ids-info (list id) invalidate-cache)))
+
+(defun magit-gerrit--commit-changes (rev)
+  "Look up the change of commit REV and its cherry-picks.
+The change whose current patchset is REV comes first."
+  (when-let* ((id (magit-gerrit-commit-change-id rev)))
+    (let ((hash (magit-rev-parse rev)))
+      (seq-sort-by (lambda (change) (if (equal (magit-gerrit-change-revision change) hash) 0 1))
+                   #'< (magit-gerrit--get-change-id-info id)))))
+
+(defun magit-gerrit--format-change-summary (change)
+  "Return a one-line summary of CHANGE: number, status and votes."
+  (let ((votes (make-hash-table :test #'equal)))
+    (dolist (approval (magit-gerrit-change-approvals change))
+      (push (string-to-number (alist-get 'value approval))
+            (gethash (alist-get 'type approval) votes)))
+    (string-join
+     (delq nil
+           (append
+            (list (propertize (format "#%s" (magit-gerrit-change-number change))
+                              'font-lock-face 'magit-hash)
+                  (propertize (concat (magit-gerrit-change-status change)
+                                      (if (magit-gerrit-change-wip-p change) " WIP" ""))
+                              'font-lock-face
+                              (pcase (magit-gerrit-change-status change)
+                                ("MERGED" 'success) ("ABANDONED" 'shadow) (_ 'warning))))
+            (mapcar (lambda (label)
+                      (when-let* ((values (gethash (car label) votes)))
+                        (let* ((min (apply #'min values)) (max (apply #'max values))
+                               (value (if (< min 0) min max)))
+                          (concat (cadr label) (magit-gerrit--format-vote value)))))
+                    magit-gerrit-review-labels)))
+     " ")))
 
 
 ;;; Gitiles
@@ -921,14 +1004,8 @@ With a prefix argument, the query is set for all repositories."
     ("S" "Save a query"            magit-gerrit-save-query)
     ("a" "Toggle all projects"     magit-gerrit-toggle-all-projects)]])
 
-(defun magit-gerrit-change-id-browse-url (&optional id)
-  "Go to the Gerrit URL of the change with Change-Id ID."
-  (interactive (list (magit-gerrit-commit-change-id)))
-  (when-let* ((vals (magit-gerrit--get-change-id-info id))
-              (vals (delq nil (mapcar #'magit-gerrit-change-url vals))))
-    (browse-url (if (length= vals 1)
-                    (car vals)
-                  (completing-read "Select URL: " vals)))))
+(define-obsolete-function-alias 'magit-gerrit-change-id-browse-url
+  #'magit-gerrit-browse-commit "0.2.0")
 
 (defun magit-gerrit-gitiles-browse-url (with-line-p)
   "Browse this file in Gitiles, highlight current line when WITH-LINE-P."
@@ -1309,6 +1386,97 @@ of the current branch or read from the minibuffer."
    ("w" "as work in progress"              magit-gerrit-push-wip-for-review)])
 
 
+;;; Revision and log buffers
+
+(defun magit-gerrit-insert-revision-change ()
+  "Insert the Gerrit change of the commit shown in a revision buffer."
+  (when (and magit-gerrit-show-revision-change
+             (bound-and-true-p magit-gerrit-mode)
+             (bound-and-true-p magit-buffer-revision))
+    (condition-case err
+        (when-let* ((changes (magit-gerrit--commit-changes magit-buffer-revision)))
+          (magit-insert-section (gerrit-revision-changes)
+            (dolist (change changes)
+              (magit-insert-section (gerrit-change change)
+                (insert (format "%-11s" "Gerrit:")
+                        (magit-gerrit--format-change-summary change)
+                        " "
+                        (propertize (magit-gerrit-change-branch change) 'font-lock-face 'magit-branch-remote)
+                        " "
+                        (propertize (or (magit-gerrit-change-url change) "") 'font-lock-face 'link)
+                        "\n")))
+            (insert "\n")))
+      (error
+       (insert (propertize (format "Gerrit: %s\n\n" (error-message-string err))
+                           'font-lock-face 'error))))))
+
+(magit-add-section-hook 'magit-revision-sections-hook
+                        #'magit-gerrit-insert-revision-change
+                        #'magit-insert-revision-headers t)
+
+(defun magit-gerrit--log-commits ()
+  "Return the commit sections of the current log buffer."
+  (let (sections)
+    (magit-map-sections (lambda (section)
+                          (when (eq (oref section type) 'commit)
+                            (push section sections))))
+    (nreverse sections)))
+
+(defun magit-gerrit-annotate-log ()
+  "Annotate the commits of the current log buffer with their change.
+See `magit-gerrit-annotate-log'."
+  (remove-overlays (point-min) (point-max) 'magit-gerrit-annotation t)
+  (when (and magit-gerrit-annotate-log (bound-and-true-p magit-gerrit-mode))
+    (condition-case err
+        (let* ((sections (seq-take (magit-gerrit--log-commits) magit-gerrit-annotate-log-max))
+               (ids (when sections
+                      (mapcar (lambda (line) (split-string line "\0"))
+                              (magit-git-lines "show" "--no-patch"
+                                               "--format=%h%x00%(trailers:key=Change-Id,valueonly,separator=%x2C)"
+                                               (mapcar (lambda (s) (oref s value)) sections)))))
+               (ids (seq-filter (lambda (pair) (and (cadr pair) (not (string-empty-p (cadr pair))))) ids))
+               (infos (magit-gerrit--get-change-ids-info
+                       (mapcar (lambda (pair) (car (split-string (cadr pair) ","))) ids))))
+          (cl-loop for section in sections
+                   for (_ id) = (seq-find (lambda (pair) (string-prefix-p (car pair) (oref section value)))
+                                          ids)
+                   for change = (and id (cadr (assoc (car (split-string id ",")) infos)))
+                   when change
+                   do (let ((overlay (save-excursion
+                                       (goto-char (oref section start))
+                                       (make-overlay (line-end-position) (line-end-position)))))
+                        (overlay-put overlay 'magit-gerrit-annotation t)
+                        (overlay-put overlay 'after-string
+                                     (concat " " (magit-gerrit--format-change-summary change))))))
+      (error (message "magit-gerrit: cannot annotate the log: %s" (error-message-string err))))))
+
+(defun magit-gerrit--read-commit-change (prompt)
+  "Return the change of the commit at point, or of a commit read with PROMPT.
+When the Change-Id matches several changes (cherry-picks on other
+branches), let the user choose."
+  (let* ((rev (or (magit-commit-at-point) (magit-read-branch-or-commit prompt)))
+         (changes (or (magit-gerrit--commit-changes rev)
+                      (user-error "No Gerrit change for %s" rev))))
+    (if (length= changes 1)
+        (car changes)
+      (let ((choices (mapcar (lambda (c) (cons (format "%s %s (%s)" (magit-gerrit-change-number c)
+                                                       (magit-gerrit-change-branch c)
+                                                       (magit-gerrit-change-status c))
+                                               c))
+                             changes)))
+        (cdr (assoc (completing-read "Change: " choices nil t) choices))))))
+
+(defun magit-gerrit-show-commit-change (change)
+  "Show the Gerrit CHANGE of the commit at point."
+  (interactive (list (magit-gerrit--read-commit-change "Show change of commit")))
+  (magit-gerrit-show-change (magit-gerrit-change-number change)))
+
+(defun magit-gerrit-browse-commit (change)
+  "Browse the Gerrit CHANGE of the commit at point."
+  (interactive (list (magit-gerrit--read-commit-change "Browse change of commit")))
+  (browse-url (magit-gerrit-change-url change)))
+
+
 ;;; Change buffer
 
 (defvar-keymap magit-gerrit-patchset-section-map
@@ -1661,6 +1829,9 @@ Interactively, show the change at point or read its number."
   [["Others"
     ("P" "Push for review"                 magit-gerrit-push)
     ("/" "Query"                           magit-gerrit-query)]
+   ["Commit at point"
+    ("o" "Show its change"                 magit-gerrit-show-commit-change)
+    ("O" "Browse its change"               magit-gerrit-browse-commit)]
    [("y" "Copy review URL"                 magit-gerrit-copy-review-url)
     ("Y" "Copy review URL and subject"     magit-gerrit-copy-review-url-commit-message)
     ("r" "Copy review reference"           magit-gerrit-copy-ref)]])
@@ -1680,7 +1851,10 @@ Add the Gerrit reviews section to the status buffer and bind
   :keymap magit-gerrit-mode-map
   :group 'magit-gerrit
   (if (not magit-gerrit-mode)
-      (remove-hook 'magit-status-sections-hook #'magit-gerrit-insert-reviews-section t)
+      (progn
+        (remove-hook 'magit-status-sections-hook #'magit-gerrit-insert-reviews-section t)
+        (remove-hook 'magit-refresh-buffer-hook #'magit-gerrit-annotate-log t)
+        (remove-overlays (point-min) (point-max) 'magit-gerrit-annotation t))
     (when-let* ((err (cond
                       ((not (derived-mode-p 'magit-mode))
                        "This mode only makes sense with magit")
@@ -1692,7 +1866,9 @@ Add the Gerrit reviews section to the status buffer and bind
       (user-error "%s" err))
     (magit-add-section-hook 'magit-status-sections-hook
                             #'magit-gerrit-insert-reviews-section
-                            'magit-insert-stashes t t))
+                            'magit-insert-stashes t t)
+    (when (derived-mode-p 'magit-log-mode)
+      (add-hook 'magit-refresh-buffer-hook #'magit-gerrit-annotate-log nil t)))
   (when (called-interactively-p 'any)
     (magit-refresh)))
 
@@ -1717,7 +1893,8 @@ Add the Gerrit reviews section to the status buffer and bind
   "Try to auto enable magit-gerrit in the `magit-status' buffer."
   (interactive)
   (add-hook 'magit-status-mode-hook #'magit-gerrit-check-enable t)
-  (add-hook 'magit-log-mode-hook #'magit-gerrit-check-enable t))
+  (add-hook 'magit-log-mode-hook #'magit-gerrit-check-enable t)
+  (add-hook 'magit-revision-mode-hook #'magit-gerrit-check-enable t))
 
 (provide 'magit-gerrit)
 
