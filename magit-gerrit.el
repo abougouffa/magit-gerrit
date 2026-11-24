@@ -317,9 +317,119 @@ Uses `magit-gerrit-query-filters' or \"status:open\"."
   (when-let* ((msg (transient-arg-value "--message=" args)))
     (list "--message" msg)))
 
-(defun magit-gerrit--review (prj rev &rest args)
-  "Run \"gerrit review\" for revision REV of project PRJ with ARGS."
-  (magit-gerrit--ssh-call "review" "--project" prj args rev))
+(defun magit-gerrit--review (change &rest args)
+  "Run \"gerrit review\" on the current patchset of CHANGE with ARGS."
+  (magit-gerrit--ssh-call "review"
+                          "--project" (magit-gerrit-change-project change)
+                          args
+                          (magit-gerrit-change-revision change)))
+
+
+;;; Change data model
+
+;; Changes are the objects returned by "gerrit query --format=JSON", parsed
+;; as alists (see `magit-gerrit--parse-json-lines').  Their structure is
+;; documented in https://gerrit-review.googlesource.com/Documentation/json.html
+
+(defun magit-gerrit--get (obj &rest keys)
+  "Return the value at the path KEYS in the nested alist OBJ."
+  (dolist (key keys obj)
+    (setq obj (alist-get key obj))))
+
+(defun magit-gerrit-change-number (change)
+  "Return the number of CHANGE."
+  (magit-gerrit--get change 'number))
+
+(defun magit-gerrit-change-id (change)
+  "Return the Change-Id of CHANGE."
+  (magit-gerrit--get change 'id))
+
+(defun magit-gerrit-change-project (change)
+  "Return the project of CHANGE."
+  (magit-gerrit--get change 'project))
+
+(defun magit-gerrit-change-branch (change)
+  "Return the target branch of CHANGE."
+  (magit-gerrit--get change 'branch))
+
+(defun magit-gerrit-change-topic (change)
+  "Return the topic of CHANGE, if any."
+  (magit-gerrit--get change 'topic))
+
+(defun magit-gerrit-change-subject (change)
+  "Return the subject of CHANGE."
+  (magit-gerrit--get change 'subject))
+
+(defun magit-gerrit-change-commit-message (change)
+  "Return the commit message of the current patchset of CHANGE."
+  (magit-gerrit--get change 'commitMessage))
+
+(defun magit-gerrit-change-url (change)
+  "Return the URL of CHANGE."
+  (magit-gerrit--get change 'url))
+
+(defun magit-gerrit-change-status (change)
+  "Return the status of CHANGE (\"NEW\", \"MERGED\" or \"ABANDONED\")."
+  (magit-gerrit--get change 'status))
+
+(defun magit-gerrit-change-last-updated (change)
+  "Return the last update time of CHANGE, in seconds since the epoch."
+  (magit-gerrit--get change 'lastUpdated))
+
+(defun magit-gerrit-change-owner-name (change)
+  "Return the name of the owner of CHANGE."
+  (magit-gerrit--get change 'owner 'name))
+
+(defun magit-gerrit-change-owner-username (change)
+  "Return the username of the owner of CHANGE."
+  (magit-gerrit--get change 'owner 'username))
+
+(defun magit-gerrit-change-wip-p (change)
+  "Return non-nil when CHANGE is a work in progress (or a legacy draft)."
+  (or (eq (magit-gerrit--get change 'wip) t)
+      (eq (magit-gerrit--get change 'currentPatchSet 'isDraft) t)))
+
+(defun magit-gerrit-change-patchset (change)
+  "Return the current patchset of CHANGE."
+  (magit-gerrit--get change 'currentPatchSet))
+
+(defun magit-gerrit-change-patchset-number (change)
+  "Return the number of the current patchset of CHANGE."
+  (magit-gerrit--get change 'currentPatchSet 'number))
+
+(defun magit-gerrit-change-revision (change)
+  "Return the commit hash of the current patchset of CHANGE."
+  (magit-gerrit--get change 'currentPatchSet 'revision))
+
+(defun magit-gerrit-change-ref (change)
+  "Return the ref of the current patchset of CHANGE."
+  (magit-gerrit--get change 'currentPatchSet 'ref))
+
+(defun magit-gerrit-change-approvals (change)
+  "Return the approvals of the current patchset of CHANGE."
+  (magit-gerrit--get change 'currentPatchSet 'approvals))
+
+(defun magit-gerrit-change-insertions (change)
+  "Return the number of inserted lines in the current patchset of CHANGE."
+  (or (magit-gerrit--get change 'currentPatchSet 'sizeInsertions) 0))
+
+(defun magit-gerrit-change-deletions (change)
+  "Return the number of deleted lines in the current patchset of CHANGE.
+Gerrit reports deletions as a negative number, this returns its
+absolute value."
+  (abs (or (magit-gerrit--get change 'currentPatchSet 'sizeDeletions) 0)))
+
+(defun magit-gerrit-change-at-point ()
+  "Return the Gerrit change at point, or nil."
+  (magit-section-value-if 'gerrit-change))
+
+(defun magit-gerrit--change-at-point-or-error ()
+  "Return the Gerrit change at point, signal an error if there is none."
+  (or (magit-gerrit-change-at-point)
+      (user-error "No Gerrit change at point")))
+
+(define-obsolete-function-alias 'magit-gerrit-review-at-point
+  #'magit-gerrit-change-at-point "0.2.0")
 
 
 ;;; Remote and project
@@ -567,28 +677,24 @@ subject is dimmed."
 
 ;;; Status section
 
-(defun magit-gerrit--insert-review (jobj)
-  "Insert the review JOBJ (a change returned by a Gerrit query)."
-  (let* ((num (cdr-safe (assoc 'number jobj)))
-         (subj (cdr-safe (assoc 'subject jobj)))
-         (br (cdr-safe (assoc 'branch jobj)))
-         (owner (cdr-safe (assoc 'owner jobj)))
-         (owner-name (cdr-safe (assoc 'name owner)))
-         (patchsets (cdr-safe (assoc 'currentPatchSet jobj)))
-         (patchset-num (cdr-safe (assoc 'number patchsets)))
-         (last-update (cdr-safe (assoc 'lastUpdated jobj)))
-         (size-insert (cdr-safe (assoc 'sizeInsertions patchsets)))
-         (size-delete (cdr-safe (assoc 'sizeDeletions patchsets)))
-         (isdraft (eq (cdr-safe (assoc 'isDraft patchsets)) t))
-         (approvs (cdr-safe (assoc 'approvals patchsets)))
-         (scoreinfo (magit-gerrit-wash-approvals-oneline approvs)))
-    (when (and num subj owner-name)
-      (magit-insert-section (section subj)
-        (insert (propertize
-                 (magit-gerrit-pretty-print-review
-                  num patchset-num subj owner-name br size-insert
-                  size-delete last-update scoreinfo isdraft)
-                 'magit-gerrit-jobj jobj))))))
+(defun magit-gerrit--insert-review (change)
+  "Insert a section for CHANGE (as returned by a Gerrit query)."
+  (when (and (magit-gerrit-change-number change)
+             (magit-gerrit-change-subject change)
+             (magit-gerrit-change-owner-name change))
+    (magit-insert-section (gerrit-change change)
+      (insert (magit-gerrit-pretty-print-review
+               (magit-gerrit-change-number change)
+               (magit-gerrit-change-patchset-number change)
+               (magit-gerrit-change-subject change)
+               (magit-gerrit-change-owner-name change)
+               (magit-gerrit-change-branch change)
+               (magit-gerrit-change-insertions change)
+               (magit-gerrit-change-deletions change)
+               (magit-gerrit-change-last-updated change)
+               (magit-gerrit-wash-approvals-oneline
+                (magit-gerrit-change-approvals change))
+               (magit-gerrit-change-wip-p change))))))
 
 (defun magit-gerrit-insert-reviews-section ()
   "Insert the Gerrit reviews section in the status buffer.
@@ -614,10 +720,6 @@ Errors are displayed in the section instead of aborting the refresh."
 (defun magit-gerrit-create-branch (_branch _parent)
   "Not implemented.")
 
-(defun magit-gerrit-review-at-point ()
-  "Return the review at point."
-  (get-text-property (point) 'magit-gerrit-jobj))
-
 (defsubst magit-gerrit-process-wait ()
   "Wait for the current Magit process to finish."
   (while (and magit-this-process (eq (process-status magit-this-process) 'run))
@@ -637,10 +739,9 @@ Succeed even if branch already exist
 (defun magit-gerrit-get-ref (&optional select-number)
   "Return the ref of the review at point.
 When SELECT-NUMBER is non-nil, ask for the patchset number."
-  (when-let* ((jobj (magit-gerrit-review-at-point))
-              (curr-patchset (assoc 'currentPatchSet jobj))
-              (ref (cdr (assoc 'ref curr-patchset)))
-              (number (cdr (assoc 'number curr-patchset))))
+  (when-let* ((change (magit-gerrit-change-at-point))
+              (ref (magit-gerrit-change-ref change))
+              (number (magit-gerrit-change-patchset-number change)))
     (if select-number
         (concat (string-join
                  (append (butlast (string-split ref "/"))
@@ -673,7 +774,7 @@ Edit globally when called with universal argument ARG."
   "Go to the Gerrit URL of the change with Change-Id ID."
   (interactive (list (magit-gerrit-commit-change-id)))
   (when-let* ((vals (magit-gerrit--get-change-id-info id))
-              (vals (seq-filter #'identity (mapcar (apply-partially #'alist-get 'url) vals))))
+              (vals (delq nil (mapcar #'magit-gerrit-change-url vals))))
     (browse-url (if (length= vals 1)
                     (car vals)
                   (completing-read "Select URL: " vals)))))
@@ -696,11 +797,15 @@ Edit globally when called with universal argument ARG."
 (defun magit-gerrit-download-patchset (&optional select-number)
   "Download a Gerrit review patchset, optionally SELECT-NUMBER."
   (interactive "P")
-  (when-let* ((jobj (magit-gerrit-review-at-point))
+  (when-let* ((change (magit-gerrit-change-at-point))
               (ref (magit-gerrit-get-ref select-number)))
     (let* ((dir default-directory)
            (num (string-join (last (string-split ref "/") 2) "/"))
-           (branch (format "review/%s/%s%s" (alist-get 'username (assoc 'owner jobj)) (if-let* ((topic (alist-get 'topic jobj))) (concat topic "-") "") num)))
+           (topic (magit-gerrit-change-topic change))
+           (branch (format "review/%s/%s%s"
+                           (magit-gerrit-change-owner-username change)
+                           (if topic (concat topic "-") "")
+                           num)))
       (magit-gerrit-fetch-patchset ref)
       (message (format "Checking out refs %s to %s in %s" ref branch dir))
       (magit-gerrit-create-branch-force branch "FETCH_HEAD"))))
@@ -714,19 +819,20 @@ Edit globally when called with universal argument ARG."
 (defun magit-gerrit-browse-review ()
   "Browse the Gerrit Review with a browser."
   (interactive)
-  (if-let* ((jobj (magit-gerrit-review-at-point)))
-      (browse-url (cdr (assoc 'url jobj)))
+  (if-let* ((change (magit-gerrit-change-at-point)))
+      (browse-url (magit-gerrit-change-url change))
     (call-interactively #'magit-visit-thing)))
 
 (defun magit-gerrit-copy-review (with-commit-message)
   "Copy review url and commit message when WITH-COMMIT-MESSAGE is non-nil."
-  (when-let* ((jobj (magit-gerrit-review-at-point)))
+  (when-let* ((change (magit-gerrit-change-at-point)))
     (with-temp-buffer
       (insert
        (concat (when with-commit-message
-                 (concat (format "%s: " (cdr-safe (assoc 'number jobj)))
-                         (car (split-string (cdr (assoc 'commitMessage jobj)) "\n" t)) " | "))
-               (cdr (assoc 'url jobj))))
+                 (concat (format "%s: " (magit-gerrit-change-number change))
+                         (car (split-string (magit-gerrit-change-commit-message change) "\n" t))
+                         " | "))
+               (magit-gerrit-change-url change)))
       (message "%s" (buffer-string))
       (clipboard-kill-region (point-min) (point-max)))))
 
@@ -753,45 +859,42 @@ Edit globally when called with universal argument ARG."
 (defun magit-gerrit-add-reviewer ()
   "Add a reviewer to the review at point."
   (interactive)
-  (magit-gerrit--ssh-call
-   "set-reviewers"
-   "--project" (magit-gerrit-get-project)
-   "--add" (read-string "Reviewer Name/Email: ")
-   (cdr-safe (assoc 'id (magit-gerrit-review-at-point)))))
+  (let ((change (magit-gerrit--change-at-point-or-error)))
+    (magit-gerrit--ssh-call
+     "set-reviewers"
+     "--project" (magit-gerrit-change-project change)
+     "--add" (read-string "Reviewer Name/Email: ")
+     (magit-gerrit-change-id change))
+    (magit-refresh)))
 
 (defun magit-gerrit-arguments ()
   "Return the arguments of the `magit-gerrit-dispatch' transient."
   (transient-args 'magit-gerrit-dispatch))
 
-(defun magit-gerrit--current-revision ()
-  "Return the current patchset revision of the review at point."
-  (or (cdr-safe (assoc 'revision
-                       (cdr-safe (assoc 'currentPatchSet
-                                        (magit-gerrit-review-at-point)))))
-      (user-error "No Gerrit review at point")))
+(defun magit-gerrit--read-score ()
+  "Read a review score."
+  (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1"))
 
 (defun magit-gerrit-verify-review (args)
   "Verify a Gerrit review, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (let ((rev (magit-gerrit--current-revision))
-        (score (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1")))
-    (magit-gerrit--review (magit-gerrit-get-project) rev
-                          "--verified" score (magit-gerrit--message-args args))
-    (magit-refresh)))
+  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
+                        "--verified" (magit-gerrit--read-score)
+                        (magit-gerrit--message-args args))
+  (magit-refresh))
 
 (defun magit-gerrit-code-review (args)
   "Perform a Gerrit code review, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (let ((rev (magit-gerrit--current-revision))
-        (score (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1")))
-    (magit-gerrit--review (magit-gerrit-get-project) rev
-                          "--code-review" score (magit-gerrit--message-args args))
-    (magit-refresh)))
+  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
+                        "--code-review" (magit-gerrit--read-score)
+                        (magit-gerrit--message-args args))
+  (magit-refresh))
 
 (defun magit-gerrit-submit-review (args)
   "Submit a Gerrit code review, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review (magit-gerrit-get-project) (magit-gerrit--current-revision)
+  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
                         "--submit" (magit-gerrit--message-args args))
   (magit-fetch-all-no-prune)
   (magit-refresh))
@@ -799,14 +902,14 @@ Edit globally when called with universal argument ARG."
 (defun magit-gerrit-abandon-review (args)
   "Abandon the review at point, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review (magit-gerrit-get-project) (magit-gerrit--current-revision)
+  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
                         "--abandon" (magit-gerrit--message-args args))
   (magit-refresh))
 
 (defun magit-gerrit-restore-review (args)
   "Restore the abandoned review at point, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review (magit-gerrit-get-project) (magit-gerrit--current-revision)
+  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
                         "--restore" (magit-gerrit--message-args args))
   (magit-refresh))
 
