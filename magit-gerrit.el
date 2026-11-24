@@ -165,7 +165,7 @@ loading `magit-gerrit') so that `magit-gerrit-mode-map' is updated."
                      (magit-gerrit--key value) #'magit-gerrit-dispatch)))
 
 (defcustom magit-gerrit-signed-push-p nil
-  "Whether or not to push with the --signed option."
+  "Whether to push with the --signed option by default."
   :group 'magit-gerrit
   :type 'boolean)
 
@@ -246,12 +246,9 @@ See https://gerrit-review.googlesource.com/Documentation/user-search.html")
 (defconst magit-gerrit-log-buffer-name "*magit-gerrit-log*"
   "Name of the buffer logging the Gerrit SSH commands.")
 
-(defconst magit-gerrit-push-options
-  '((wip) (ready) (private) (remove-private) (publish-comments)
-    (hashtag . t) (topic . t) (message . t) (notify . (NONE OWNER OWNER_REVIEWERS ALL)))
-  "Gerrit push options, as an alist of (OPTION . VALUES).
-VALUES is nil for flags, t for free text values or a list of
-possible values.")
+(defvar magit-gerrit-reviewer-history nil
+  "Minibuffer history of reviewers and CCs.")
+(add-to-list 'savehist-additional-variables 'magit-gerrit-reviewer-history)
 
 
 ;;; Gerrit SSH commands
@@ -958,54 +955,129 @@ submit the change after voting."
 
 ;;; Push
 
-(defun magit-gerrit-read-push-option ()
-  "Read a Gerrit push option, see `magit-gerrit-push-options'."
-  (let* ((option (intern (completing-read "Select an option: " magit-gerrit-push-options nil t)))
-         (choice (alist-get option magit-gerrit-push-options))
-         (prompt (format "Value for option %S: " option))
-         (val
-          (cond ((eq choice t) (read-string prompt))
-                ((consp choice) (completing-read prompt choice nil t)))))
-    (concat "%" (format "%s" option) (when val (format "=%s" val)))))
+(defun magit-gerrit--account-candidates ()
+  "Return the accounts to offer when reading reviewers."
+  (seq-uniq magit-gerrit-reviewer-history))
 
-(defun magit-gerrit-push-review (status &optional option)
-  "Push the commit at point to refs/STATUS/<branch> with push OPTION."
-  (let* ((branch (magit-get-current-branch))
-         (branch-remote (and branch (magit-get "branch" branch "remote")))
-         (branch-remote (and (not (or (null branch-remote) (string= branch-remote "."))) branch-remote)))
-    (when-let* (((or branch (y-or-n-p "Not on a branch, push a detached head? ")))
-                (commitid (or (magit-section-value-if 'commit) (error "Couldn't find a commit at point")))
-                (rev (magit-rev-parse (or commitid (error "Select a commit for review"))))
-                (branch-merge (if (and branch branch-remote)
-                                  (magit-get "branch" branch "merge")
-                                (completing-read
-                                 "Remote Branch: "
-                                 (let ((rbs (magit-list-remote-branch-names)))
-                                   (or
-                                    (mapcar
-                                     (lambda (rb)
-                                       (and (string-match "^[^/]+/\\(.+\\)$" rb) (concat "refs/heads/" (match-string 1 rb))))
-                                     rbs)
-                                    '("refs/heads/master"))))))
-                (branch-pub (and (string-match "refs/heads\\(.+\\)" branch-merge)
-                                 (format "refs/%s%s" status (match-string 1 branch-merge)))))
-      (unless branch-remote (setq branch-remote magit-gerrit-remote))
-      (magit-run-git-async "push" "-v" (when magit-gerrit-signed-push-p "--signed") branch-remote (concat rev ":" branch-pub option)))))
+(defun magit-gerrit--read-accounts (prompt &optional initial-input _history)
+  "Read a comma separated list of accounts with PROMPT and INITIAL-INPUT.
+Return them as a comma separated string."
+  (let ((accounts (completing-read-multiple prompt (magit-gerrit--account-candidates)
+                                            nil nil initial-input
+                                            'magit-gerrit-reviewer-history)))
+    (when accounts
+      (string-join accounts ","))))
 
-(defun magit-gerrit-push-for-review (&optional with-opt)
-  "Push the commit at point for review.
-When WITH-OPT is non-nil, ask for a push option."
-  (interactive "P")
-  (magit-gerrit-push-review 'for (when with-opt (magit-gerrit-read-push-option))))
+(defun magit-gerrit--default-target-branch ()
+  "Return the branch the current branch is pushed for review to, or nil.
+This is the upstream branch of the current branch, when it is on the
+Gerrit remote."
+  (when-let* ((branch (magit-get-current-branch))
+              ((equal (magit-get "branch" branch "remote") magit-gerrit-remote))
+              (merge (magit-get "branch" branch "merge")))
+    (string-remove-prefix "refs/heads/" merge)))
 
-(defun magit-gerrit-push-draft-for-review (&optional with-opt)
-  "Push the commit at point as a draft for review.
-When WITH-OPT is non-nil, ask for a push option."
-  (interactive "P")
-  (magit-gerrit-push-review 'drafts (when with-opt (magit-gerrit-read-push-option))))
+(defun magit-gerrit--read-target-branch (prompt &optional initial-input history)
+  "Read the target branch of a review with PROMPT, INITIAL-INPUT and HISTORY."
+  (magit-gerrit-get-remote-url)  ; Make sure `magit-gerrit-remote' is set
+  (magit-completing-read prompt
+                         (magit-list-remote-branch-names magit-gerrit-remote t)
+                         nil nil initial-input history
+                         (magit-gerrit--default-target-branch)))
 
+(defun magit-gerrit--encode-push-message (message)
+  "Encode MESSAGE for the \"m\" push option.
+Gerrit replaces underscores by spaces, then percent-decodes the
+message, so all the characters except alphanumerics, \"-\", \".\" and
+\"~\" are percent-encoded."
+  (mapconcat (lambda (byte)
+               (if (or (<= ?a byte ?z) (<= ?A byte ?Z) (<= ?0 byte ?9) (memq byte '(?- ?. ?~)))
+                   (char-to-string byte)
+                 (format "%%%02X" byte)))
+             (encode-coding-string message 'utf-8)
+             ""))
+
+(defun magit-gerrit--check-push-value (name value)
+  "Signal an error when VALUE, the value of push option NAME, is invalid."
+  (when (string-match-p "[ ,%\t\n]" value)
+    (user-error "The %s can't contain spaces, commas or %%: %S" name value))
+  value)
+
+(defun magit-gerrit--push-options (args)
+  "Return the Gerrit push options for the transient ARGS.
+See https://gerrit-review.googlesource.com/Documentation/user-upload.html#push_options"
+  (let ((split (lambda (arg) (when-let* ((value (transient-arg-value arg args)))
+                               (split-string value "," t "[ \t]+")))))
+    (append
+     (when-let* ((topic (transient-arg-value "--topic=" args)))
+       (list (concat "topic=" (magit-gerrit--check-push-value "topic" topic))))
+     (mapcar (lambda (tag) (concat "t=" (magit-gerrit--check-push-value "hashtag" tag)))
+             (funcall split "--hashtag="))
+     (mapcar (lambda (account) (concat "r=" (magit-gerrit--check-push-value "reviewer" account)))
+             (funcall split "--reviewers="))
+     (mapcar (lambda (account) (concat "cc=" (magit-gerrit--check-push-value "CC" account)))
+             (funcall split "--cc="))
+     (seq-keep (lambda (flag) (and (member (concat "--" flag) args) flag))
+               '("wip" "ready" "private" "remove-private" "publish-comments"))
+     (when-let* ((notify (transient-arg-value "--notify=" args)))
+       (list (concat "notify=" notify)))
+     (when-let* ((message (transient-arg-value "--message=" args)))
+       (list (concat "m=" (magit-gerrit--encode-push-message message)))))))
+
+(defun magit-gerrit--push-refspec (rev branch args)
+  "Return the refspec to push REV for review on BRANCH with transient ARGS."
+  (let ((options (magit-gerrit--push-options args)))
+    (format "%s:refs/for/%s%s" rev branch
+            (if options (concat "%" (string-join options ",")) ""))))
+
+(defun magit-gerrit-push-for-review (args)
+  "Push the commit at point (or HEAD) for review, using transient ARGS.
+The target branch is the \"--branch=\" argument, the upstream branch
+of the current branch or read from the minibuffer."
+  (interactive (list (transient-args 'magit-gerrit-push)))
+  (magit-gerrit-get-remote-url)  ; Make sure `magit-gerrit-remote' is set
+  (let* ((commit (or (magit-commit-at-point) "HEAD"))
+         (rev (or (magit-rev-parse commit) (user-error "No commit to push")))
+         (branch (or (transient-arg-value "--branch=" args)
+                     (magit-gerrit--default-target-branch)
+                     (magit-gerrit--read-target-branch "Target branch: "))))
+    (magit-run-git-async "push" "-v" (when (member "--signed" args) "--signed")
+                         magit-gerrit-remote
+                         (magit-gerrit--push-refspec rev branch args))))
+
+(defun magit-gerrit-push-wip-for-review (args)
+  "Push the commit at point (or HEAD) as work in progress, using ARGS."
+  (interactive (list (transient-args 'magit-gerrit-push)))
+  (magit-gerrit-push-for-review (cons "--wip" (remove "--ready" args))))
+
+(define-obsolete-function-alias 'magit-gerrit-push-draft-for-review
+  #'magit-gerrit-push-wip-for-review "0.2.0"
+  "Drafts were replaced by work in progress changes in Gerrit 2.15.")
 (define-obsolete-function-alias 'magit-gerrit-create-review 'magit-gerrit-push-for-review "1.0.0")
 (define-obsolete-function-alias 'magit-gerrit-create-draft 'magit-gerrit-push-draft-for-review "1.0.0")
+
+;;;###autoload (autoload 'magit-gerrit-push "magit-gerrit" nil t)
+(transient-define-prefix magit-gerrit-push ()
+  "Push a commit for review to Gerrit."
+  :init-value (lambda (obj) (oset obj value (and magit-gerrit-signed-push-p '("--signed"))))
+  :incompatible '(("--wip" "--ready") ("--private" "--remove-private"))
+  ["Arguments"
+   ("-b" "Target branch"      "--branch=" :reader magit-gerrit--read-target-branch)
+   ("-t" "Topic"              "--topic=")
+   ("-h" "Hashtags (a,b)"     "--hashtag=")
+   ("-r" "Reviewers"          "--reviewers=" :reader magit-gerrit--read-accounts)
+   ("-c" "CC"                 "--cc=" :reader magit-gerrit--read-accounts)
+   ("-m" "Message"            "--message=")
+   ("-n" "Notify"             "--notify=" :choices ("NONE" "OWNER" "OWNER_REVIEWERS" "ALL"))
+   ("-w" "Work in progress"   "--wip")
+   ("-R" "Ready for review"   "--ready")
+   ("-p" "Private"            "--private")
+   ("-P" "Remove private"     "--remove-private")
+   ("-e" "Publish draft comments" "--publish-comments")
+   ("-S" "Signed push"        "--signed")]
+  ["Push commit at point (or HEAD)"
+   ("p" "for review"                       magit-gerrit-push-for-review)
+   ("w" "as work in progress"              magit-gerrit-push-wip-for-review)])
 
 
 ;;; Change buffer
@@ -1341,9 +1413,8 @@ Interactively, show the change at point or read its number."
     ("A" "Add reviewer"                    magit-gerrit-add-reviewer)
     ("B" "Abandon review"                  magit-gerrit-abandon-review)
     ("R" "Restore abandoned review"        magit-gerrit-restore-review)
-    ("P" "Push commit for review"          magit-gerrit-push-for-review)
-    ("S" "Submit review"                   magit-gerrit-submit-review)
-    ("W" "Push commit for draft review"    magit-gerrit-push-draft-for-review)]
+    ("P" "Push for review"                 magit-gerrit-push)
+    ("S" "Submit review"                   magit-gerrit-submit-review)]
    ["Review"
     ("RET" "Show change"                   magit-gerrit-show-change)
     ("b" "Browse review"                   magit-gerrit-browse-review)
