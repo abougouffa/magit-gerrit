@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Fake ssh client talking to a fake Gerrit server, for the tests.
+
+Like the real ssh, the arguments after the host are joined with spaces
+and parsed on the server side, here with a port of Gerrit's own parser.
+The parsed command line is saved in $MAGIT_GERRIT_TEST_STATE/last.json
+(and appended to calls.log), the standard input of "--json" commands in
+stdin.json.  Queries are answered with the JSON fixtures.
+"""
+import json
+import os
+import sys
+import time
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+STATE = os.environ["MAGIT_GERRIT_TEST_STATE"]
+
+
+def split(command_line):
+    """Port of com.google.gerrit.sshd.CommandFactoryProvider#split."""
+    out, current, in_quote, in_dbl_quote, i = [], "", False, False, 0
+    while i < len(command_line):
+        c = command_line[i]
+        i += 1
+        if c in " \t":
+            if in_quote or in_dbl_quote:
+                current += c
+            elif current:
+                out.append(current)
+                current = ""
+        elif c == '"':
+            if in_quote:
+                current += c
+            else:
+                in_dbl_quote = not in_dbl_quote
+        elif c == "'":
+            if in_dbl_quote:
+                current += c
+            else:
+                in_quote = not in_quote
+        elif c == "\\":
+            if in_quote or i == len(command_line):
+                current += c
+            else:
+                current += command_line[i]
+                i += 1
+        else:
+            current += c
+    if current:
+        out.append(current)
+    return out
+
+
+def fixture(name):
+    with open(os.path.join(FIXTURES, name), encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def stats(rows):
+    print(json.dumps({"type": "stats", "rowCount": rows}))
+
+
+def main():
+    time.sleep(float(os.environ.get("FAKE_SSH_DELAY", "0")))
+    args = sys.argv[1:]
+    i = 0
+    while args[i].startswith("-"):  # skip the ssh options
+        i += 2 if args[i] == "-p" else 1
+    argv = split(" ".join(args[i + 1:]))
+    with open(os.path.join(STATE, "last.json"), "w", encoding="utf-8") as f:
+        json.dump(argv, f)
+    with open(os.path.join(STATE, "calls.log"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(argv) + "\n")
+    if "--json" in argv:
+        with open(os.path.join(STATE, "stdin.json"), "w", encoding="utf-8") as f:
+            f.write(sys.stdin.read())
+    if "fail" in argv:
+        sys.stderr.write('fatal: "fail" is not a valid option\n')
+        sys.exit(1)
+    if argv[1] != "query":
+        return
+    query = " ".join(argv)
+    if "change:bad" in argv:
+        print(json.dumps({"type": "error", "message": "bad query"}))
+    elif "change:1234" in query and ("--patch-sets" in argv or "--all-reviewers" in argv):
+        print(fixture("change-1234.json"))
+        stats(1)
+    elif "change:I" in query:  # Change-Id lookups
+        rows = [line for line in fixture("changes.json").splitlines()
+                if "change:" + json.loads(line)["id"] in query]
+        print("\n".join(rows))
+        stats(len(rows))
+    else:
+        print(fixture("changes.json"))
+        stats(2)
+
+
+if __name__ == "__main__":
+    main()

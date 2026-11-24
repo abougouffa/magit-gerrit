@@ -1,0 +1,10 @@
+#!/bin/sh
+# Fake scp for the tests: writes a commit-msg hook to its last argument.
+# Simulates an OpenSSH older than 9.0, without "-O", when FAKE_SCP_NO_O is set.
+echo "$@" >> "$MAGIT_GERRIT_TEST_STATE/scp.log"
+if [ "$1" = "-O" ] && [ -n "$FAKE_SCP_NO_O" ]; then
+    echo "unknown option -- O" >&2
+    exit 1
+fi
+for last; do :; done
+printf '#!/bin/sh\n# gerrit hook (scp)\n' > "$last"
