@@ -297,21 +297,25 @@ are quoted for Gerrit."
       (unless (string-empty-p stderr)
         (insert stderr "\n")))))
 
-(defun magit-gerrit--ssh-call (cmd &rest args)
+(defun magit-gerrit--ssh-run (input cmd args)
   "Call Gerrit's command CMD with ARGS via SSH and return its output.
-ARGS are processed as in `magit-gerrit--command'.  Signal a
+When INPUT is non-nil, it is sent to the standard input of the
+command.  ARGS are processed as in `magit-gerrit--command'.  Signal a
 `user-error' containing the error output when the command fails.
 All the calls are logged in `magit-gerrit-log-buffer-name'."
   (let ((ssh-args (apply #'magit-gerrit--command cmd args))
         (err-file (make-temp-file "magit-gerrit-"))
+        (in-file (when input (make-temp-file "magit-gerrit-in-" nil nil input)))
         ;; SSH is always run locally, even for remote repositories
         (default-directory (if (file-remote-p default-directory)
                                temporary-file-directory
                              default-directory)))
     (unwind-protect
         (with-temp-buffer
-          (let* ((exit-code (apply #'call-process magit-gerrit-ssh-program
-                                   nil (list t err-file) nil ssh-args))
+          (let* ((coding-system-for-write 'utf-8)
+                 (coding-system-for-read 'utf-8)
+                 (exit-code (apply #'call-process magit-gerrit-ssh-program
+                                   in-file (list t err-file) nil ssh-args))
                  (stderr (with-temp-buffer
                            (insert-file-contents err-file)
                            (string-trim (buffer-string)))))
@@ -322,7 +326,22 @@ All the calls are logged in `magit-gerrit-log-buffer-name'."
                               (format "exit code %s" exit-code)
                             (car (split-string stderr "\n" t)))))
             (buffer-string)))
-      (delete-file err-file))))
+      (delete-file err-file)
+      (when in-file (delete-file in-file)))))
+
+(defun magit-gerrit--ssh-call (cmd &rest args)
+  "Call Gerrit's command CMD with ARGS via SSH and return its output.
+See `magit-gerrit--ssh-run'."
+  (magit-gerrit--ssh-run nil cmd args))
+
+(defun magit-gerrit--review-json (change input)
+  "Run \"gerrit review --json\" on the current patchset of CHANGE.
+INPUT is an alist, sent as a ReviewInput entity, see
+https://gerrit-review.googlesource.com/Documentation/rest-api-changes.html#review-input"
+  (magit-gerrit--ssh-run (json-encode input) "review"
+                         (list "--project" (magit-gerrit-change-project change)
+                               "--json"
+                               (magit-gerrit-change-revision change))))
 
 (defun magit-gerrit--json-parse (string)
   "Parse the JSON object in STRING as an alist, arrays as lists.
@@ -351,12 +370,26 @@ Gerrit reports an error."
           (_ (push obj changes)))))
     (nreverse changes)))
 
+(defvar magit-gerrit--known-accounts (make-hash-table :test #'equal)
+  "Accounts seen in query results, offered when reading reviewers.")
+
+(defun magit-gerrit--remember-accounts (change)
+  "Remember the accounts (owner, reviewers, voters) involved in CHANGE."
+  (dolist (account (append (list (alist-get 'owner change))
+                           (alist-get 'allReviewers change)
+                           (mapcar (lambda (a) (alist-get 'by a))
+                                   (magit-gerrit--get change 'currentPatchSet 'approvals))))
+    (when-let* ((id (or (alist-get 'email account) (alist-get 'username account))))
+      (puthash id t magit-gerrit--known-accounts))))
+
 (defun magit-gerrit--query-changes (query &rest options)
   "Run the Gerrit QUERY with OPTIONS, return the matching change list.
 QUERY is a string or a list of query terms, OPTIONS are additional
 options for \"gerrit query\" such as \"--current-patch-set\"."
-  (magit-gerrit--parse-json-lines
-   (magit-gerrit--ssh-call "query" "--format=JSON" options query)))
+  (let ((changes (magit-gerrit--parse-json-lines
+                  (magit-gerrit--ssh-call "query" "--format=JSON" options query))))
+    (mapc #'magit-gerrit--remember-accounts changes)
+    changes))
 
 (defun magit-gerrit--query-terms (&optional prj)
   "Return the query terms to list the reviews of project PRJ.
@@ -973,16 +1006,103 @@ With a prefix argument, the query is set for all repositories."
   (magit-gerrit--copy (or (magit-gerrit-get-ref select-number)
                           (user-error "No Gerrit change at point"))))
 
-(defun magit-gerrit-add-reviewer ()
-  "Add a reviewer to the review at point."
-  (interactive)
+(defun magit-gerrit--read-account-list (prompt)
+  "Read a non-empty list of accounts with PROMPT."
+  (or (completing-read-multiple prompt (magit-gerrit--account-candidates)
+                                nil nil nil 'magit-gerrit-reviewer-history)
+      (user-error "No account")))
+
+(defun magit-gerrit--change-reviewers (change)
+  "Return the reviewers of CHANGE, querying them if needed."
+  (or (alist-get 'allReviewers change)
+      (alist-get 'allReviewers
+                 (car (magit-gerrit--query-changes
+                       (format "change:%s" (magit-gerrit-change-number change))
+                       "--all-reviewers")))))
+
+(defun magit-gerrit-add-reviewer (accounts)
+  "Add ACCOUNTS as reviewers to the change at point."
+  (interactive (list (magit-gerrit--read-account-list "Add reviewers: ")))
   (let ((change (magit-gerrit--change-at-point-or-error)))
     (magit-gerrit--ssh-call
      "set-reviewers"
      "--project" (magit-gerrit-change-project change)
-     "--add" (read-string "Reviewer Name/Email: ")
+     (mapcar (lambda (account) (list "--add" account)) accounts)
      (magit-gerrit-change-id change))
     (magit-refresh)))
+
+(defun magit-gerrit-remove-reviewer (accounts)
+  "Remove ACCOUNTS from the reviewers of the change at point."
+  (interactive
+   (let ((change (magit-gerrit--change-at-point-or-error)))
+     (list (or (completing-read-multiple
+                "Remove reviewers: "
+                (seq-keep (lambda (account)
+                            (or (alist-get 'email account) (alist-get 'username account)))
+                          (magit-gerrit--change-reviewers change)))
+               (user-error "No account")))))
+  (let ((change (magit-gerrit--change-at-point-or-error)))
+    (magit-gerrit--ssh-call
+     "set-reviewers"
+     "--project" (magit-gerrit-change-project change)
+     (mapcar (lambda (account) (list "--remove" account)) accounts)
+     (magit-gerrit-change-id change))
+    (magit-refresh)))
+
+(defun magit-gerrit-add-cc (accounts)
+  "Add ACCOUNTS in CC of the change at point."
+  (interactive (list (magit-gerrit--read-account-list "Add CC: ")))
+  (magit-gerrit--review-json
+   (magit-gerrit--change-at-point-or-error)
+   `((reviewers . ,(vconcat (mapcar (lambda (account) `((reviewer . ,account) (state . "CC")))
+                                    accounts)))))
+  (magit-refresh))
+
+(defun magit-gerrit-mark-wip (args)
+  "Mark the change at point as work in progress, using transient ARGS."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--review-json
+   (magit-gerrit--change-at-point-or-error)
+   `((work_in_progress . t)
+     ,@(when-let* ((msg (transient-arg-value "--message=" args))) `((message . ,msg)))))
+  (magit-refresh))
+
+(defun magit-gerrit-mark-ready (args)
+  "Mark the change at point as ready for review, using transient ARGS."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--review-json
+   (magit-gerrit--change-at-point-or-error)
+   `((ready . t)
+     ,@(when-let* ((msg (transient-arg-value "--message=" args))) `((message . ,msg)))))
+  (magit-refresh))
+
+(defun magit-gerrit-set-topic (topic)
+  "Set the TOPIC of the change at point (an empty topic to remove it)."
+  (interactive
+   (let ((change (magit-gerrit--change-at-point-or-error)))
+     (list (read-string "Topic (empty to remove): " (magit-gerrit-change-topic change)))))
+  (let ((change (magit-gerrit--change-at-point-or-error)))
+    (magit-gerrit--ssh-call
+     "set-topic"
+     (format "%s~%s~%s" (magit-gerrit-change-project change)
+             (magit-gerrit-change-branch change) (magit-gerrit-change-id change))
+     (unless (string-empty-p (string-trim topic))
+       (list "--topic" (string-trim topic))))
+    (magit-refresh)))
+
+(defun magit-gerrit-rebase-review ()
+  "Rebase the change at point on Gerrit."
+  (interactive)
+  (magit-gerrit--review (magit-gerrit--change-at-point-or-error) "--rebase")
+  (magit-refresh))
+
+(defun magit-gerrit-move-review (branch args)
+  "Move the change at point to BRANCH, using transient ARGS."
+  (interactive (list (magit-gerrit--read-target-branch "Move to branch: ")
+                     (magit-gerrit-arguments)))
+  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
+                        "--move" branch (magit-gerrit--message-args args))
+  (magit-refresh))
 
 (defun magit-gerrit-arguments ()
   "Return the arguments of the `magit-gerrit-dispatch' transient."
@@ -1063,8 +1183,10 @@ submit the change after voting."
 ;;; Push
 
 (defun magit-gerrit--account-candidates ()
-  "Return the accounts to offer when reading reviewers."
-  (seq-uniq magit-gerrit-reviewer-history))
+  "Return the accounts to offer when reading reviewers.
+These are the previously entered ones and the ones seen in queries."
+  (seq-uniq (append magit-gerrit-reviewer-history
+                    (hash-table-keys magit-gerrit--known-accounts))))
 
 (defun magit-gerrit--read-accounts (prompt &optional initial-input _history)
   "Read a comma separated list of accounts with PROMPT and INITIAL-INPUT.
@@ -1516,24 +1638,32 @@ Interactively, show the change at point or read its number."
    ("-n" "Notify"                          "--notify="
     :choices ("NONE" "OWNER" "OWNER_REVIEWERS" "ALL"))
    ("-s" "Submit after voting"             "--submit")]
-  [["Actions"
-    ("A" "Add reviewer"                    magit-gerrit-add-reviewer)
-    ("B" "Abandon review"                  magit-gerrit-abandon-review)
-    ("R" "Restore abandoned review"        magit-gerrit-restore-review)
-    ("P" "Push for review"                 magit-gerrit-push)
-    ("S" "Submit review"                   magit-gerrit-submit-review)]
-   ["Review"
-    ("RET" "Show change"                   magit-gerrit-show-change)
-    ("b" "Browse review"                   magit-gerrit-browse-review)
+  [["Change"
+    ("RET" "Show"                          magit-gerrit-show-change)
+    ("b" "Browse"                          magit-gerrit-browse-review)
     ("v" "Vote"                            magit-gerrit-vote)
-    ("d" "View patchset diff"              magit-gerrit-view-patchset-diff)
-    ("D" "Download patchset"               magit-gerrit-download-patchset)
-    ("F" "Cherry-pick patchset"            magit-gerrit-cherry-pick-patchset)]]
-  ["Others"
-   ("/" "Query"                            magit-gerrit-query)
-   ("y" "Copy review URL"                  magit-gerrit-copy-review-url)
-   ("Y" "Copy review URL and message"      magit-gerrit-copy-review-url-commit-message)
-   ("r" "Copy review reference (hash)"     magit-gerrit-copy-ref)])
+    ("S" "Submit"                          magit-gerrit-submit-review)
+    ("u" "Rebase"                          magit-gerrit-rebase-review)
+    ("M" "Move to branch"                  magit-gerrit-move-review)
+    ("B" "Abandon"                         magit-gerrit-abandon-review)
+    ("R" "Restore"                         magit-gerrit-restore-review)]
+   ["Reviewers & state"
+    ("A" "Add reviewers"                   magit-gerrit-add-reviewer)
+    ("K" "Remove reviewers"                magit-gerrit-remove-reviewer)
+    ("c" "Add CC"                          magit-gerrit-add-cc)
+    ("T" "Set topic"                       magit-gerrit-set-topic)
+    ("w" "Mark work in progress"           magit-gerrit-mark-wip)
+    ("W" "Mark ready for review"           magit-gerrit-mark-ready)]
+   ["Patchset"
+    ("d" "View diff"                       magit-gerrit-view-patchset-diff)
+    ("D" "Download (checkout)"             magit-gerrit-download-patchset)
+    ("F" "Cherry-pick"                     magit-gerrit-cherry-pick-patchset)]]
+  [["Others"
+    ("P" "Push for review"                 magit-gerrit-push)
+    ("/" "Query"                           magit-gerrit-query)]
+   [("y" "Copy review URL"                 magit-gerrit-copy-review-url)
+    ("Y" "Copy review URL and subject"     magit-gerrit-copy-review-url-commit-message)
+    ("r" "Copy review reference"           magit-gerrit-copy-ref)]])
 
 
 ;;; Minor mode
