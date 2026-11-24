@@ -235,6 +235,20 @@ the commits whose change isn't cached yet."
   :group 'magit-gerrit
   :type 'integer)
 
+(defcustom magit-gerrit-async-reviews nil
+  "Whether to fetch the reviews of the status buffer asynchronously.
+When non-nil, refreshing the status buffer shows the reviews fetched
+previously (or a placeholder) and fetches them in the background; the
+status buffer is refreshed again when they are fetched."
+  :group 'magit-gerrit
+  :type 'boolean)
+
+(defcustom magit-gerrit-async-min-interval 10
+  "Minimum number of seconds between two asynchronous fetches of reviews.
+Refreshing the status buffer more often reuses the last result."
+  :group 'magit-gerrit
+  :type 'integer)
+
 (defcustom magit-gerrit-collapse-patchset-section nil
   "Collapse/hide gerrit section containing patchsets by default.
 Collapse/hide the section body containing the list of gerrit
@@ -435,14 +449,22 @@ Gerrit reports an error."
     (when-let* ((id (or (alist-get 'email account) (alist-get 'username account))))
       (puthash id t magit-gerrit--known-accounts))))
 
+(defun magit-gerrit--query-args (query options)
+  "Return the arguments of \"gerrit query\" for QUERY and OPTIONS."
+  (list "--format=JSON" options query))
+
+(defun magit-gerrit--parse-query-output (output)
+  "Parse the OUTPUT of a Gerrit query, return the parsed change list."
+  (let ((changes (magit-gerrit--parse-json-lines output)))
+    (mapc #'magit-gerrit--remember-accounts changes)
+    changes))
+
 (defun magit-gerrit--query-changes (query &rest options)
   "Run the Gerrit QUERY with OPTIONS, return the matching change list.
 QUERY is a string or a list of query terms, OPTIONS are additional
 options for \"gerrit query\" such as \"--current-patch-set\"."
-  (let ((changes (magit-gerrit--parse-json-lines
-                  (magit-gerrit--ssh-call "query" "--format=JSON" options query))))
-    (mapc #'magit-gerrit--remember-accounts changes)
-    changes))
+  (magit-gerrit--parse-query-output
+   (magit-gerrit--ssh-call "query" (magit-gerrit--query-args query options))))
 
 (defun magit-gerrit--query-terms (&optional prj)
   "Return the query terms to list the reviews of project PRJ.
@@ -458,10 +480,84 @@ non-nil."
        magit-gerrit-extra-options)
      (list (or magit-gerrit-query-filters "status:open")))))
 
+(defconst magit-gerrit--reviews-query-options '("--current-patch-set" "--submit-records")
+  "Options of the query listing the reviews.")
+
 (defun magit-gerrit--fetch-reviews ()
   "Fetch the reviews of the current project."
   (when-let* ((terms (magit-gerrit--query-terms)))
-    (magit-gerrit--query-changes terms "--current-patch-set" "--submit-records")))
+    (apply #'magit-gerrit--query-changes terms magit-gerrit--reviews-query-options)))
+
+(defvar magit-gerrit--async-cache (make-hash-table :test #'equal)
+  "Reviews fetched asynchronously.
+Keys are (TOPLEVEL CREDENTIALS QUERY-TERMS), values are plists with
+the properties :time (of the last completed fetch), :changes, :error
+and :process (the running fetch).")
+
+(defun magit-gerrit--async-refresh-status (toplevel)
+  "Refresh the status buffers of the repository TOPLEVEL."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'magit-status-mode)
+                 (equal (magit-toplevel) toplevel))
+        (magit-refresh-buffer)))))
+
+(defun magit-gerrit--async-fetch (key terms)
+  "Fetch the reviews matching TERMS in the background, store them at KEY."
+  (let* ((toplevel (car key))
+         (ssh-args (apply #'magit-gerrit--command "query"
+                          (magit-gerrit--query-args terms magit-gerrit--reviews-query-options)))
+         (stdout (generate-new-buffer " *magit-gerrit-async*"))
+         (stderr (generate-new-buffer " *magit-gerrit-async-err*"))
+         (default-directory (if (file-remote-p default-directory)
+                                temporary-file-directory
+                              default-directory))
+         (process
+          (make-process
+           :name "magit-gerrit-reviews"
+           :buffer stdout
+           :stderr stderr
+           :command (cons magit-gerrit-ssh-program ssh-args)
+           :connection-type 'pipe
+           :coding 'utf-8
+           :noquery t
+           :sentinel
+           (lambda (process _event)
+             (unless (process-live-p process)
+               (let* ((exit-code (process-exit-status process))
+                      (err (with-current-buffer stderr (string-trim (buffer-string))))
+                      (entry (gethash key magit-gerrit--async-cache))
+                      (result (if (eq exit-code 0)
+                                  (condition-case e
+                                      (list :changes (magit-gerrit--parse-query-output
+                                                      (with-current-buffer stdout (buffer-string))))
+                                    (error (list :error (error-message-string e))))
+                                (list :changes (plist-get entry :changes)
+                                      :error (format "Gerrit command \"query\" failed: %s"
+                                                     (if (string-empty-p err)
+                                                         (format "exit code %s" exit-code)
+                                                       (car (split-string err "\n" t))))))))
+                 (magit-gerrit--log ssh-args exit-code err)
+                 (kill-buffer stdout)
+                 (kill-buffer stderr)
+                 (puthash key (append (list :time (current-time)) result)
+                          magit-gerrit--async-cache)
+                 (magit-gerrit--async-refresh-status toplevel)))))))
+    (puthash key (plist-put (copy-sequence (gethash key magit-gerrit--async-cache))
+                            :process process)
+             magit-gerrit--async-cache)))
+
+(defun magit-gerrit--async-reviews ()
+  "Return the cached reviews, fetching them in the background if needed.
+Return a plist with the :changes, :error and :process properties."
+  (when-let* ((terms (magit-gerrit--query-terms)))
+    (let* ((key (list (magit-toplevel) magit-gerrit-ssh-creds terms))
+           (entry (gethash key magit-gerrit--async-cache))
+           (time (plist-get entry :time)))
+      (unless (or (process-live-p (plist-get entry :process))
+                  (and time (< (float-time (time-since time)) magit-gerrit-async-min-interval)))
+        (magit-gerrit--async-fetch key terms))
+      (gethash key magit-gerrit--async-cache))))
 
 (defun magit-gerrit--message-args (args)
   "Return the \"gerrit review\" arguments from the transient ARGS.
@@ -876,11 +972,18 @@ Errors are displayed in the section instead of aborting the refresh."
                 (or magit-gerrit-query-filters "status:open")
                 (if magit-gerrit-query-all-projects ", all projects" "")))
       (insert (magit-gerrit-pretty-print-review-header))
-      (condition-case err
-          (mapc #'magit-gerrit--insert-review (magit-gerrit--fetch-reviews))
-        (error
-         (insert (propertize (format "%s\n" (error-message-string err))
-                             'font-lock-face 'error))))
+      (if magit-gerrit-async-reviews
+          (let ((entry (magit-gerrit--async-reviews)))
+            (mapc #'magit-gerrit--insert-review (plist-get entry :changes))
+            (when-let* ((err (plist-get entry :error)))
+              (insert (propertize (format "%s\n" err) 'font-lock-face 'error)))
+            (when (and (not (plist-get entry :time)) (process-live-p (plist-get entry :process)))
+              (insert (propertize "Loading...\n" 'font-lock-face 'shadow))))
+        (condition-case err
+            (mapc #'magit-gerrit--insert-review (magit-gerrit--fetch-reviews))
+          (error
+           (insert (propertize (format "%s\n" (error-message-string err))
+                               'font-lock-face 'error)))))
       (insert "\n"))))
 
 
