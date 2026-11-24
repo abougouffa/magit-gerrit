@@ -175,6 +175,13 @@ This can be a list of terms, or a string of space-separated terms."
   :group 'magit-gerrit
   :type '(choice (repeat string) string))
 
+(defcustom magit-gerrit-saved-queries nil
+  "Saved Gerrit queries, as an alist of (NAME . QUERY).
+See https://gerrit-review.googlesource.com/Documentation/user-search.html
+and `magit-gerrit-save-query'."
+  :group 'magit-gerrit
+  :type '(alist :key-type (string :tag "Name") :value-type (string :tag "Query")))
+
 (defcustom magit-gerrit-collapse-patchset-section nil
   "Collapse/hide gerrit section containing patchsets by default.
 Collapse/hide the section body containing the list of gerrit
@@ -223,6 +230,9 @@ parameter of `magit-insert-section'."
 (defvar-local magit-gerrit-query-filters nil
   "Query used to list the reviews, defaults to \"status:open\" when nil.
 See https://gerrit-review.googlesource.com/Documentation/user-search.html")
+
+(defvar-local magit-gerrit-query-all-projects nil
+  "When non-nil, list the reviews of all projects, not only the current one.")
 
 (put 'magit-gerrit-ssh-creds 'safe-local-variable #'stringp)
 (put 'magit-gerrit-remote 'safe-local-variable #'stringp)
@@ -350,10 +360,13 @@ options for \"gerrit query\" such as \"--current-patch-set\"."
 
 (defun magit-gerrit--query-terms (&optional prj)
   "Return the query terms to list the reviews of project PRJ.
-Uses `magit-gerrit-query-filters' or \"status:open\"."
+Uses `magit-gerrit-query-filters' or \"status:open\".  The project
+is not part of the query when `magit-gerrit-query-all-projects' is
+non-nil."
   (when-let* ((prj (or prj (magit-gerrit-get-project))))
     (append
-     (list (concat "project:" prj))
+     (unless magit-gerrit-query-all-projects
+       (list (concat "project:" prj)))
      (if (stringp magit-gerrit-extra-options)
          (split-string magit-gerrit-extra-options)
        magit-gerrit-extra-options)
@@ -714,7 +727,10 @@ the face of the subject."
 Errors are displayed in the section instead of aborting the refresh."
   (when (magit-gerrit-get-project)
     (magit-insert-section (gerrit-reviews nil magit-gerrit-collapse-patchset-section)
-      (magit-insert-heading "Reviews:")
+      (magit-insert-heading
+        (format "Reviews [%s%s]:"
+                (or magit-gerrit-query-filters "status:open")
+                (if magit-gerrit-query-all-projects ", all projects" "")))
       (insert (magit-gerrit-pretty-print-review-header))
       (condition-case err
           (mapc #'magit-gerrit--insert-review (magit-gerrit--fetch-reviews))
@@ -770,16 +786,107 @@ The patchset is available as FETCH_HEAD afterwards.  Return REF."
 
 ;;; Commands
 
+(defun magit-gerrit-set-query (query &optional global)
+  "Set the QUERY listing the reviews and refresh.
+QUERY nil means the default, \"status:open\".  Set it for the
+current repository, or for all the repositories when GLOBAL is
+non-nil."
+  (if global
+      (progn (kill-local-variable 'magit-gerrit-query-filters)
+             (setq-default magit-gerrit-query-filters query))
+    (setq-local magit-gerrit-query-filters query))
+  (magit-refresh))
+
 (defun magit-gerrit-edit-filters (arg)
-  "Edit the Gerrit query filters.
+  "Edit the Gerrit query filters (an empty query means the default).
 Edit globally when called with universal argument ARG."
   (interactive "P")
-  (when-let* ((filters (read-string "Query filters: " magit-gerrit-query-filters 'magit-gerrit-query-filters-history))
-              ((not (string-empty-p filters))))
-    (kill-local-variable 'magit-gerrit-query-filters)
-    (if arg
-        (setq-default magit-gerrit-query-filters filters)
-      (setq-local magit-gerrit-query-filters filters))))
+  (let ((filters (string-trim
+                  (read-string "Query filters: " magit-gerrit-query-filters
+                               'magit-gerrit-query-filters-history))))
+    (magit-gerrit-set-query (unless (string-empty-p filters) filters) arg)))
+
+(defmacro magit-gerrit--define-query (name query doc)
+  "Define a command named after NAME setting QUERY, with docstring DOC."
+  (declare (indent 1) (doc-string 3))
+  `(defun ,(intern (format "magit-gerrit-query-%s" name)) (&optional global)
+     ,(concat doc "\nSet it globally when called with a prefix argument GLOBAL.")
+     (interactive "P")
+     (magit-gerrit-set-query ,query global)))
+
+(magit-gerrit--define-query open nil
+  "List the open changes (the default).")
+(magit-gerrit--define-query mine "owner:self status:open"
+  "List my open changes.")
+(magit-gerrit--define-query incoming "reviewer:self -owner:self -is:wip status:open"
+  "List the open changes I'm reviewing.")
+(magit-gerrit--define-query starred "is:starred status:open"
+  "List the open changes I starred.")
+(magit-gerrit--define-query watched "is:watched status:open"
+  "List the open changes I watch.")
+(magit-gerrit--define-query merged "status:merged -age:1week"
+  "List the changes merged during the last week.")
+
+(defun magit-gerrit-query-topic (topic &optional global)
+  "Show the reviews of TOPIC, by default the topic of the change at point.
+Set it globally when called with a prefix argument GLOBAL."
+  (interactive
+   (list (let ((default (when-let* ((change (magit-gerrit-change-at-point)))
+                          (magit-gerrit-change-topic change))))
+           (read-string (format-prompt "Topic" default) nil nil default))
+         current-prefix-arg))
+  (when (string-empty-p topic)
+    (user-error "No topic"))
+  ;; Gerrit allows quoting values with curly braces
+  (magit-gerrit-set-query (format "topic:{%s}" topic) global))
+
+(defun magit-gerrit-query-saved (query &optional global)
+  "Show the reviews matching the saved QUERY.
+See `magit-gerrit-saved-queries'.
+Set it globally when called with a prefix argument GLOBAL."
+  (interactive
+   (list (let ((name (completing-read "Saved query: " magit-gerrit-saved-queries nil t)))
+           (or (cdr (assoc name magit-gerrit-saved-queries)) (user-error "No saved query")))
+         current-prefix-arg))
+  (magit-gerrit-set-query query global))
+
+(defun magit-gerrit-save-query (name query)
+  "Save the current QUERY as NAME in `magit-gerrit-saved-queries'."
+  (interactive
+   (let ((query (read-string "Query: " (or magit-gerrit-query-filters "status:open"))))
+     (list (read-string "Name: ") query)))
+  (customize-save-variable 'magit-gerrit-saved-queries
+                           (cons (cons name query)
+                                 (assoc-delete-all name (copy-sequence magit-gerrit-saved-queries)))))
+
+(defun magit-gerrit-toggle-all-projects ()
+  "Toggle listing the reviews of all the projects."
+  (interactive)
+  (setq-local magit-gerrit-query-all-projects (not magit-gerrit-query-all-projects))
+  (magit-refresh))
+
+;;;###autoload (autoload 'magit-gerrit-query "magit-gerrit" nil t)
+(transient-define-prefix magit-gerrit-query ()
+  "Choose the Gerrit query listing the reviews.
+With a prefix argument, the query is set for all repositories."
+  [:description
+   (lambda () (format "Current query: %s%s"
+                      (propertize (or magit-gerrit-query-filters "status:open")
+                                  'face 'transient-value)
+                      (if magit-gerrit-query-all-projects " (all projects)" "")))
+   ["Presets"
+    ("o" "Open changes"            magit-gerrit-query-open)
+    ("m" "My changes"              magit-gerrit-query-mine)
+    ("i" "Incoming reviews"        magit-gerrit-query-incoming)
+    ("s" "Starred"                 magit-gerrit-query-starred)
+    ("w" "Watched"                 magit-gerrit-query-watched)
+    ("M" "Recently merged"         magit-gerrit-query-merged)]
+   ["Custom"
+    ("t" "Topic"                   magit-gerrit-query-topic)
+    ("e" "Edit query"              magit-gerrit-edit-filters)
+    ("l" "Saved query"             magit-gerrit-query-saved)
+    ("S" "Save a query"            magit-gerrit-save-query)
+    ("a" "Toggle all projects"     magit-gerrit-toggle-all-projects)]])
 
 (defun magit-gerrit-change-id-browse-url (&optional id)
   "Go to the Gerrit URL of the change with Change-Id ID."
@@ -1423,6 +1530,7 @@ Interactively, show the change at point or read its number."
     ("D" "Download patchset"               magit-gerrit-download-patchset)
     ("F" "Cherry-pick patchset"            magit-gerrit-cherry-pick-patchset)]]
   ["Others"
+   ("/" "Query"                            magit-gerrit-query)
    ("y" "Copy review URL"                  magit-gerrit-copy-review-url)
    ("Y" "Copy review URL and message"      magit-gerrit-copy-review-url-commit-message)
    ("r" "Copy review reference (hash)"     magit-gerrit-copy-ref)])
