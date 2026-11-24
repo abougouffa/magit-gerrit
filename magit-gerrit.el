@@ -6,7 +6,7 @@
 ;; Author: Brian Fransioli <assem@terranpro.org>
 ;; Author: Abdelhak Bougouffa
 ;; URL: https://github.com/terranpro/magit-gerrit
-;; Package-Requires: ((emacs "29.1") (magit "3.3.0") (transient "0.3.0"))
+;; Package-Requires: ((emacs "29.1") (magit "4.0.0") (transient "0.5.0"))
 ;; Package-Version: 0.1.0
 
 ;; This program is free software; you can redistribute it and/or
@@ -170,6 +170,20 @@ inherited and this setting is ignored.  See also the HIDE
 parameter of `magit-insert-section'."
   :group 'magit-gerrit
   :type 'boolean)
+
+(defcustom magit-gerrit-change-sections-hook
+  '(magit-gerrit-insert-change-headers
+    magit-gerrit-insert-change-message
+    magit-gerrit-insert-change-labels
+    magit-gerrit-insert-change-reviewers
+    magit-gerrit-insert-change-dependencies
+    magit-gerrit-insert-change-files
+    magit-gerrit-insert-change-patchsets
+    magit-gerrit-insert-change-messages
+    magit-gerrit-insert-change-comments)
+  "Hook run to insert sections into a Gerrit change buffer."
+  :group 'magit-gerrit
+  :type 'hook)
 
 
 ;;; Per-repository variables
@@ -445,9 +459,22 @@ Gerrit reports deletions as a negative number, this returns its
 absolute value."
   (abs (or (magit-gerrit--get change 'currentPatchSet 'sizeDeletions) 0)))
 
+(defvar-local magit-gerrit-buffer-change-number nil
+  "Number of the change shown in a `magit-gerrit-change-mode' buffer.")
+
+(defvar-local magit-gerrit-buffer-change nil
+  "The change shown in a `magit-gerrit-change-mode' buffer.")
+
 (defun magit-gerrit-change-at-point ()
-  "Return the Gerrit change at point, or nil."
-  (magit-section-value-if 'gerrit-change))
+  "Return the Gerrit change at point, or nil.
+In a change buffer, this is the change shown in the buffer."
+  (or (magit-section-value-if 'gerrit-change)
+      (and (derived-mode-p 'magit-gerrit-change-mode)
+           magit-gerrit-buffer-change)))
+
+(defun magit-gerrit-patchset-at-point ()
+  "Return the patchset at point in a change buffer, or nil."
+  (magit-section-value-if 'gerrit-patchset))
 
 (defun magit-gerrit--change-at-point-or-error ()
   "Return the Gerrit change at point, signal an error if there is none."
@@ -660,7 +687,7 @@ the face of the subject."
 
 (defvar-keymap magit-gerrit-change-section-map
   :doc "Keymap for the sections of Gerrit changes."
-  "<remap> <magit-visit-thing>" #'magit-gerrit-browse-review)
+  "<remap> <magit-visit-thing>" #'magit-gerrit-show-change)
 
 (defun magit-gerrit-insert-reviews-section ()
   "Insert the Gerrit reviews section in the status buffer.
@@ -690,16 +717,22 @@ Succeed even if branch already exist
 
 (defun magit-gerrit-get-ref (&optional select-number)
   "Return the ref of the review at point.
-When SELECT-NUMBER is non-nil, ask for the patchset number."
-  (when-let* ((change (magit-gerrit-change-at-point))
-              (ref (magit-gerrit-change-ref change))
-              (number (magit-gerrit-change-patchset-number change)))
-    (if select-number
-        (concat (string-join
-                 (append (butlast (string-split ref "/"))
-                         (list (number-to-string (read-number (format "Select patch number (up to %d): " number)))))
-                 "/"))
-      ref)))
+This is the ref of the patchset at point in a change buffer, or of
+the current patchset of the change at point otherwise.  When
+SELECT-NUMBER is non-nil, ask for the patchset number."
+  (if-let* (((not select-number))
+            (patchset (magit-gerrit-patchset-at-point)))
+      (alist-get 'ref patchset)
+    (when-let* ((change (magit-gerrit-change-at-point))
+                (ref (magit-gerrit-change-ref change))
+                (number (magit-gerrit-change-patchset-number change)))
+      (if select-number
+          (string-join
+           (append (butlast (string-split ref "/"))
+                   (list (number-to-string
+                          (read-number (format "Select patch number (up to %d): " number)))))
+           "/")
+        ref))))
 
 (defun magit-gerrit-fetch-patchset (&optional ref select-number)
   "Fetch a Gerrit review patchset at REF, optionally SELECT-NUMBER.
@@ -923,6 +956,325 @@ When WITH-OPT is non-nil, ask for a push option."
 (define-obsolete-function-alias 'magit-gerrit-create-draft 'magit-gerrit-push-draft-for-review "1.0.0")
 
 
+;;; Change buffer
+
+(defvar-keymap magit-gerrit-patchset-section-map
+  :doc "Keymap for the patchset sections of a Gerrit change buffer."
+  "<remap> <magit-visit-thing>" #'magit-gerrit-show-patchset)
+
+(defvar-keymap magit-gerrit-file-section-map
+  :doc "Keymap for the file sections of a Gerrit change buffer."
+  "<remap> <magit-visit-thing>" #'magit-gerrit-show-patchset-file)
+
+(defvar-keymap magit-gerrit-comment-section-map
+  :doc "Keymap for the inline comment sections of a Gerrit change buffer."
+  "<remap> <magit-visit-thing>" #'magit-gerrit-show-patchset-file)
+
+(defvar-keymap magit-gerrit-dependency-section-map
+  :doc "Keymap for the dependency sections of a Gerrit change buffer."
+  "<remap> <magit-visit-thing>" #'magit-gerrit-show-change)
+
+(defvar-keymap magit-gerrit-change-mode-map
+  :doc "Keymap for `magit-gerrit-change-mode'."
+  :parent magit-mode-map)
+
+(define-derived-mode magit-gerrit-change-mode magit-mode "Gerrit Change"
+  "Mode for buffers showing a Gerrit change.
+
+\\<magit-gerrit-change-mode-map>\
+Type \\[magit-visit-thing] on a patchset to show it, on a file or an
+inline comment to show the diff of that file, on a dependency to show
+that change.  Type \\[magit-refresh] to fetch the change again.
+
+\\{magit-gerrit-change-mode-map}"
+  :interactive nil
+  :group 'magit-gerrit
+  ;; Make the Gerrit prefix key available, it is bound in `magit-gerrit-mode-map'
+  (set-keymap-parent magit-gerrit-change-mode-map
+                     (make-composed-keymap magit-gerrit-mode-map magit-mode-map)))
+
+(cl-defmethod magit-buffer-value (&context (major-mode magit-gerrit-change-mode))
+  "Return the number of the change shown in a buffer in MAJOR-MODE."
+  magit-gerrit-buffer-change-number)
+
+(defconst magit-gerrit--change-query-options
+  '("--current-patch-set" "--patch-sets" "--all-approvals" "--files" "--comments"
+    "--commit-message" "--dependencies" "--submit-records" "--all-reviewers")
+  "Options of the query fetching a change for the change buffer.")
+
+(defun magit-gerrit--change-number-at-point ()
+  "Return the number of the change or dependency at point, or nil."
+  (or (magit-section-value-if 'gerrit-dependency)
+      (when-let* ((change (magit-section-value-if 'gerrit-change)))
+        (magit-gerrit-change-number change))))
+
+;;;###autoload
+(defun magit-gerrit-show-change (number)
+  "Show the Gerrit change NUMBER in a dedicated buffer.
+Interactively, show the change at point or read its number."
+  (interactive
+   (list (or (magit-gerrit--change-number-at-point)
+             (read-number "Change number: "))))
+  (let ((creds magit-gerrit-ssh-creds)
+        (port magit-gerrit-port)
+        (remote magit-gerrit-remote))
+    (magit-setup-buffer #'magit-gerrit-change-mode t
+      (magit-gerrit-buffer-change-number number)
+      (magit-gerrit-ssh-creds creds)
+      (magit-gerrit-port port)
+      (magit-gerrit-remote remote))))
+
+(defun magit-gerrit-change-refresh-buffer ()
+  "Refresh the Gerrit change buffer."
+  (magit-set-header-line-format (format "Gerrit change %s" magit-gerrit-buffer-change-number))
+  (magit-insert-section (gerrit-change-buffer)
+    (condition-case err
+        (let ((change (or (car (magit-gerrit--query-changes
+                                (format "change:%s" magit-gerrit-buffer-change-number)
+                                magit-gerrit--change-query-options))
+                          (user-error "Change %s not found" magit-gerrit-buffer-change-number))))
+          (setq magit-gerrit-buffer-change change)
+          (magit-set-header-line-format
+           (format "Gerrit change %s: %s" magit-gerrit-buffer-change-number
+                   (magit-gerrit-change-subject change)))
+          (magit-run-section-hook 'magit-gerrit-change-sections-hook))
+      (error
+       (setq magit-gerrit-buffer-change nil)
+       (insert (propertize (error-message-string err) 'font-lock-face 'error) "\n")))))
+
+(defun magit-gerrit--format-time (time)
+  "Format TIME, in seconds since the epoch, as a date and an age."
+  (when time
+    (format "%s (%s ago)" (format-time-string "%F %R" time)
+            (string-trim (magit-gerrit-format-short-timestring
+                          (time-to-seconds (time-since time)))))))
+
+(defun magit-gerrit--format-account (account)
+  "Format ACCOUNT, an account attribute of Gerrit's JSON."
+  (let ((name (or (alist-get 'name account) (alist-get 'username account) "?"))
+        (email (alist-get 'email account)))
+    (concat (propertize name 'font-lock-face 'magit-log-author)
+            (when email (format " <%s>" email)))))
+
+(defun magit-gerrit--format-vote (value)
+  "Format the vote VALUE (a string or a number) with a face."
+  (let ((value (if (stringp value) (string-to-number value) value)))
+    (propertize (format "%+d" value)
+                'font-lock-face (cond ((> value 0) 'success)
+                                      ((< value 0) 'error)
+                                      (t 'shadow)))))
+
+(defun magit-gerrit--insert-header (name value &optional face)
+  "Insert the header NAME with VALUE, propertized with FACE."
+  (when (and value (not (equal value "")))
+    (insert (format "%-11s" (concat name ":"))
+            (if face (propertize (format "%s" value) 'font-lock-face face) (format "%s" value))
+            "\n")))
+
+(defun magit-gerrit-insert-change-headers ()
+  "Insert the headers of the change."
+  (let ((change magit-gerrit-buffer-change))
+    (magit-insert-section (gerrit-headers)
+      (magit-insert-heading
+        (propertize (format "%s %s" (magit-gerrit-change-number change)
+                            (magit-gerrit-change-subject change))
+                    'font-lock-face 'magit-section-heading))
+      (magit-gerrit--insert-header
+       "Status" (string-join
+                 (delq nil (list (magit-gerrit-change-status change)
+                                 (and (magit-gerrit-change-wip-p change) "WIP")
+                                 (and (eq (alist-get 'private change) t) "PRIVATE")
+                                 (when-let* ((record (car (alist-get 'submitRecords change))))
+                                   (format "(submit: %s)" (alist-get 'status record)))))
+                 " ")
+       'bold)
+      (magit-gerrit--insert-header "Project" (magit-gerrit-change-project change))
+      (magit-gerrit--insert-header "Branch" (magit-gerrit-change-branch change) 'magit-branch-remote)
+      (magit-gerrit--insert-header "Topic" (magit-gerrit-change-topic change) 'magit-tag)
+      (magit-gerrit--insert-header "Hashtags" (string-join (alist-get 'hashtags change) ", ") 'magit-tag)
+      (magit-gerrit--insert-header "Owner" (magit-gerrit--format-account (alist-get 'owner change)))
+      (magit-gerrit--insert-header "Created" (magit-gerrit--format-time (alist-get 'createdOn change)))
+      (magit-gerrit--insert-header "Updated" (magit-gerrit--format-time (magit-gerrit-change-last-updated change)))
+      (magit-gerrit--insert-header "Change-Id" (magit-gerrit-change-id change) 'magit-hash)
+      (magit-gerrit--insert-header "URL" (magit-gerrit-change-url change) 'link)
+      (insert "\n"))))
+
+(defun magit-gerrit-insert-change-message ()
+  "Insert the commit message of the current patchset."
+  (when-let* ((message (magit-gerrit-change-commit-message magit-gerrit-buffer-change)))
+    (magit-insert-section (gerrit-commit-message)
+      (magit-insert-heading "Commit message")
+      (insert (string-trim-right message) "\n\n"))))
+
+(defun magit-gerrit--change-labels (change)
+  "Return the names of the labels relevant for CHANGE."
+  (seq-uniq
+   (append (mapcar #'car magit-gerrit-review-labels)
+           (mapcar (lambda (label) (alist-get 'label label))
+                   (alist-get 'labels (car (alist-get 'submitRecords change))))
+           (mapcar (lambda (approval) (alist-get 'type approval))
+                   (magit-gerrit-change-approvals change)))))
+
+(defun magit-gerrit-insert-change-labels ()
+  "Insert the votes on the current patchset and the submit requirements."
+  (let* ((change magit-gerrit-buffer-change)
+         (record (car (alist-get 'submitRecords change)))
+         (statuses (alist-get 'labels record))
+         (approvals (magit-gerrit-change-approvals change)))
+    (magit-insert-section (gerrit-labels)
+      (magit-insert-heading "Labels")
+      (dolist (label (magit-gerrit--change-labels change))
+        (let ((status (alist-get 'status (seq-find (lambda (s) (equal (alist-get 'label s) label))
+                                                   statuses)))
+              (votes (seq-filter (lambda (a) (equal (alist-get 'type a) label)) approvals)))
+          (insert (format "%-16s" label)
+                  (propertize (format "%-8s" (or status ""))
+                              'font-lock-face (pcase status
+                                                ("OK" 'success) ((or "REJECT" "IMPOSSIBLE") 'error)
+                                                ("NEED" 'warning) (_ 'shadow)))
+                  (mapconcat (lambda (a)
+                               (concat (magit-gerrit--format-vote (alist-get 'value a)) " "
+                                       (magit-gerrit--format-account (alist-get 'by a))))
+                             votes ", ")
+                  "\n")))
+      (dolist (requirement (alist-get 'requirements record))
+        (insert (propertize "Requirement: " 'font-lock-face 'warning)
+                (or (alist-get 'fallbackText requirement) "") "\n"))
+      (insert "\n"))))
+
+(defun magit-gerrit-insert-change-reviewers ()
+  "Insert the reviewers of the change."
+  (when-let* ((reviewers (alist-get 'allReviewers magit-gerrit-buffer-change)))
+    (magit-insert-section (gerrit-reviewers)
+      (magit-insert-heading (format "Reviewers (%d)" (length reviewers)))
+      (dolist (reviewer reviewers)
+        (insert (magit-gerrit--format-account reviewer) "\n"))
+      (insert "\n"))))
+
+(defun magit-gerrit-insert-change-dependencies ()
+  "Insert the dependencies and the dependents of the change."
+  (let ((change magit-gerrit-buffer-change))
+    (pcase-dolist (`(,key . ,title) '((dependsOn . "Depends on") (neededBy . "Needed by")))
+      (when-let* ((deps (alist-get key change)))
+        (magit-insert-section (gerrit-dependencies key)
+          (magit-insert-heading title)
+          (dolist (dep deps)
+            (magit-insert-section (gerrit-dependency (alist-get 'number dep))
+              (insert (propertize (format "%-8s" (alist-get 'number dep)) 'font-lock-face 'magit-hash)
+                      (or (alist-get 'ref dep) "")
+                      (if (eq (alist-get 'isCurrentPatchSet dep) t)
+                          ""
+                        (propertize "  (outdated patchset)" 'font-lock-face 'warning))
+                      "\n")))
+          (insert "\n"))))))
+
+(defun magit-gerrit-insert-change-files ()
+  "Insert the files modified by the current patchset."
+  (let* ((patchset (magit-gerrit-change-patchset magit-gerrit-buffer-change))
+         (files (seq-remove (lambda (f) (string-prefix-p "/" (alist-get 'file f)))
+                            (alist-get 'files patchset))))
+    (when files
+      (magit-insert-section (gerrit-files)
+        (magit-insert-heading (format "Files (%d)" (length files)))
+        (dolist (file files)
+          (magit-insert-section (gerrit-file (cons (alist-get 'file file) patchset))
+            (insert (format "%-9s" (downcase (or (alist-get 'type file) "")))
+                    (propertize (format "%6s" (format "+%d" (or (alist-get 'insertions file) 0)))
+                                'font-lock-face 'diff-added)
+                    " "
+                    (propertize (format "%-6s" (format "-%d" (abs (or (alist-get 'deletions file) 0))))
+                                'font-lock-face 'diff-removed)
+                    (propertize (alist-get 'file file) 'font-lock-face 'magit-filename)
+                    (if-let* ((old (alist-get 'fileOld file))) (format " (from %s)" old) "")
+                    "\n")))
+        (insert "\n")))))
+
+(defun magit-gerrit-insert-change-patchsets ()
+  "Insert the patchsets of the change."
+  (when-let* ((patchsets (alist-get 'patchSets magit-gerrit-buffer-change)))
+    (magit-insert-section (gerrit-patchsets)
+      (magit-insert-heading (format "Patchsets (%d)" (length patchsets)))
+      (dolist (patchset (reverse patchsets))
+        (magit-insert-section (gerrit-patchset patchset)
+          (insert (propertize (format "%-4s" (alist-get 'number patchset)) 'font-lock-face 'magit-hash)
+                  (propertize (substring (or (alist-get 'revision patchset) "") 0 10)
+                              'font-lock-face 'magit-hash)
+                  " "
+                  (propertize (format "%7s" (format "+%d" (or (alist-get 'sizeInsertions patchset) 0)))
+                              'font-lock-face 'diff-added)
+                  " "
+                  (propertize (format "%-7s" (format "-%d" (abs (or (alist-get 'sizeDeletions patchset) 0))))
+                              'font-lock-face 'diff-removed)
+                  (format "%-17s" (or (alist-get 'kind patchset) ""))
+                  (magit-gerrit--format-account (alist-get 'uploader patchset))
+                  "  "
+                  (propertize (format-time-string "%F %R" (or (alist-get 'createdOn patchset) 0))
+                              'font-lock-face 'magit-log-date)
+                  "\n")))
+      (insert "\n"))))
+
+(defun magit-gerrit-insert-change-messages ()
+  "Insert the messages posted on the change."
+  (when-let* ((messages (alist-get 'comments magit-gerrit-buffer-change)))
+    (magit-insert-section (gerrit-messages)
+      (magit-insert-heading (format "Messages (%d)" (length messages)))
+      (dolist (message messages)
+        (magit-insert-section (gerrit-message message)
+          (magit-insert-heading
+            (magit-gerrit--format-account (alist-get 'reviewer message))
+            "  "
+            (propertize (format-time-string "%F %R" (or (alist-get 'timestamp message) 0))
+                        'font-lock-face 'magit-log-date))
+          (insert (replace-regexp-in-string
+                   "^" "  " (string-trim-right (or (alist-get 'message message) "")))
+                  "\n")))
+      (insert "\n"))))
+
+(defun magit-gerrit-insert-change-comments ()
+  "Insert the inline comments of all the patchsets."
+  (let ((patchsets (seq-filter (lambda (ps) (alist-get 'comments ps))
+                               (alist-get 'patchSets magit-gerrit-buffer-change))))
+    (when patchsets
+      (magit-insert-section (gerrit-comments)
+        (magit-insert-heading "Inline comments")
+        (dolist (patchset patchsets)
+          (magit-insert-section (gerrit-patchset-comments (alist-get 'number patchset))
+            (magit-insert-heading (format "Patchset %s" (alist-get 'number patchset)))
+            (dolist (comment (alist-get 'comments patchset))
+              (magit-insert-section (gerrit-comment (cons (alist-get 'file comment) patchset))
+                (magit-insert-heading
+                  (propertize (format "%s:%s" (alist-get 'file comment) (or (alist-get 'line comment) ""))
+                              'font-lock-face 'magit-filename)
+                  "  "
+                  (magit-gerrit--format-account (alist-get 'reviewer comment)))
+                (insert (replace-regexp-in-string
+                         "^" "  " (string-trim-right (or (alist-get 'message comment) "")))
+                        "\n")))))
+        (insert "\n")))))
+
+(defun magit-gerrit--fetch-revision (patchset)
+  "Fetch PATCHSET if needed and return its revision."
+  (let ((revision (alist-get 'revision patchset)))
+    (unless (magit-commit-p revision)
+      (magit-gerrit-fetch-patchset (alist-get 'ref patchset)))
+    revision))
+
+(defun magit-gerrit-show-patchset (patchset)
+  "Show the commit of PATCHSET, fetching it if needed."
+  (interactive (list (or (magit-gerrit-patchset-at-point)
+                         (magit-gerrit-change-patchset
+                          (magit-gerrit--change-at-point-or-error)))))
+  (magit-show-commit (magit-gerrit--fetch-revision patchset)))
+
+(defun magit-gerrit-show-patchset-file (file patchset)
+  "Show the diff of FILE in PATCHSET, fetching it if needed."
+  (interactive (let ((value (or (magit-section-value-if '(gerrit-file gerrit-comment))
+                                (user-error "No file at point"))))
+                 (list (car value) (cdr value))))
+  (let ((revision (magit-gerrit--fetch-revision patchset)))
+    (magit-diff-range (format "%s^..%s" revision revision) nil (list file))))
+
+
 ;;; Transient
 
 ;;;###autoload (autoload 'magit-gerrit-dispatch "magit-gerrit" nil t)
@@ -938,6 +1290,7 @@ When WITH-OPT is non-nil, ask for a push option."
     ("S" "Submit review"                   magit-gerrit-submit-review)
     ("W" "Push commit for draft review"    magit-gerrit-push-draft-for-review)]
    ["Review"
+    ("RET" "Show change"                   magit-gerrit-show-change)
     ("b" "Browse review"                   magit-gerrit-browse-review)
     ("C" "Code review"                     magit-gerrit-code-review)
     ("d" "View patchset diff"              magit-gerrit-view-patchset-diff)
