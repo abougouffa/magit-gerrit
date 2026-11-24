@@ -82,8 +82,72 @@
 (require 'transient)
 (require 'json)
 (require 'mule-util)
+(require 'project)
 (require 'savehist)
 (eval-when-compile (require 'cl-lib))
+
+
+;;; Customization
+
+(defgroup magit-gerrit nil
+  "Gerrit Code Review support for Magit."
+  :group 'magit-extensions
+  :prefix "magit-gerrit-")
+
+(defcustom magit-gerrit-use-push-url nil
+  "If non-nil, use the push URL of the remote for Gerrit connection.
+Otherwise, the fetch URL is used (see \"git remote get-url\")."
+  :group 'magit-gerrit
+  :type 'boolean)
+
+(defcustom magit-gerrit-gitiles-base-url nil
+  "The base URL for Gitiles.
+When nil, it is deduced from the remote URL as
+\"https://HOST/plugins/gitiles\"."
+  :group 'magit-gerrit
+  :type '(choice (const :tag "Deduce from remote" nil) string))
+
+(defconst magit-gerrit-default-review-labels
+  (list (list "Code-Review" "CR") (list "Verified" "Ve"))
+  "Default review labels, as a list of (LABEL ABBREVIATION).")
+
+(defcustom magit-gerrit-review-labels magit-gerrit-default-review-labels
+  "List of review labels to show, including user defined ones.
+Each element is a list (LABEL ABBREVIATION), where LABEL is the
+label name as displayed in the Gerrit UI and ABBREVIATION is a
+2 characters abbreviation used in the header of the reviews section."
+  :group 'magit-gerrit
+  :type '(repeat (list (string :tag "Label")
+                       (string :tag "Abbreviation"))))
+
+(defcustom magit-gerrit-popup-prefix "_"
+  "Key used to open the `magit-gerrit-dispatch' transient."
+  :group 'magit-gerrit
+  :type 'key-sequence)
+
+(defcustom magit-gerrit-signed-push-p nil
+  "Whether or not to push with the --signed option."
+  :group 'magit-gerrit
+  :type 'boolean)
+
+(defcustom magit-gerrit-extra-options nil
+  "Extra query terms added when fetching reviews (e.g. \"is:watched\")."
+  :group 'magit-gerrit
+  :type '(repeat string))
+
+(defcustom magit-gerrit-collapse-patchset-section nil
+  "Collapse/hide gerrit section containing patchsets by default.
+Collapse/hide the section body containing the list of gerrit
+changesets by default when t.  This only has an effect when
+creating the section for the first time.  When the section is
+recreated during a refresh, then the visibility of predecessor is
+inherited and this setting is ignored.  See also the HIDE
+parameter of `magit-insert-section'."
+  :group 'magit-gerrit
+  :type 'boolean)
+
+
+;;; Per-repository variables
 
 (defvar-local magit-gerrit-ssh-creds nil
   "Credentials used to execute gerrit commands via ssh of the form ID@Server.")
@@ -100,49 +164,46 @@
 (defvar-local magit-gerrit-port 29418
   "The default port to use with the Gerrit host.")
 
-(defcustom magit-gerrit-use-push-url nil
-  "If t use push url from 'git remote' for Gerrit connection."
-  :group 'magit-gerrit
-  :type 'boolean)
+;; https://gerrit-review.googlesource.com/Documentation/user-search.html
+;; For example we can set it to: "(status:open OR (status:merged AND -age:6months))"
+(defvar-local magit-gerrit-query-filters nil
+  "Query used to list the reviews, defaults to \"status:open\" when nil.
+See https://gerrit-review.googlesource.com/Documentation/user-search.html")
 
-(defcustom magit-gerrit-gitiles-base-url nil
-  "The base URL for Gitiles."
-  :group 'magit-gerrit
-  :type '(choice (const nil) string))
+(put 'magit-gerrit-ssh-creds 'safe-local-variable #'stringp)
+(put 'magit-gerrit-remote 'safe-local-variable #'stringp)
+(put 'magit-gerrit-port 'safe-local-variable #'integerp)
+(put 'magit-gerrit-force-enable 'safe-local-variable #'booleanp)
+(put 'magit-gerrit-query-filters 'safe-local-variable #'stringp)
 
-(defconst magit-gerrit-default-review-labels
-  (list (list "Code-Review" "CR") (list "Verified" "Ve")))
 
-(defcustom magit-gerrit-review-labels magit-gerrit-default-review-labels
-  "List of review labels including possible user defined."
-  :group 'magit-gerrit
-  :type 'list)
+;;; Internal variables
 
-(defcustom magit-gerrit-popup-prefix "_"
-  "Key code to open magit-gerrit transient."
-  :group 'magit-gerrit
-  :type 'key-sequence)
+(defvar magit-gerrit-query-filters-history nil
+  "Minibuffer history of `magit-gerrit-edit-filters'.")
+(add-to-list 'savehist-additional-variables 'magit-gerrit-query-filters-history)
 
-(defcustom magit-gerrit-signed-push-p nil
-  "Whether or not to push with the --signed option."
-  :group 'magit-gerrit
-  :type 'boolean)
+(defvar magit-gerrit--rev-change-id-cache (make-hash-table :test #'equal)
+  "Cache mapping revisions to their Change-Id.")
 
-(defcustom magit-gerrit-extra-options nil
-  "Extra options defined when fetching reviews."
-  :group 'magit-gerrit
-  :type '(repeat string))
+(defvar magit-gerrit--change-id-cache (make-hash-table :test #'equal)
+  "Cache mapping Change-Ids to Gerrit query results.")
 
-(defcustom magit-gerrit-collapse-patchset-section nil
-  "Collapse/hide gerrit section containing patchsets by default.
-Collapse/hide the section body containing the list of gerrit
-changesets by default when t. This only has an effect when
-creating the section for the first time. When the section is
-recreated during a refresh, then the visibility of predecessor is
-inherited and this setting is ignored. See also the HIDE
-parameter of `magit-insert-section'."
-  :group 'magit-gerrit
-  :type 'boolean)
+(defvar magit-gerrit--origin-action nil
+  "Command bound to `magit-gerrit-popup-prefix' before enabling the mode.")
+
+(defvar magit-gerrit--dispatch-is-added nil
+  "Non-nil when the Gerrit entry has been added to `magit-dispatch'.")
+
+(defconst magit-gerrit-push-options
+  '((wip) (ready) (private) (remove-private) (publish-comments)
+    (hashtag . t) (topic . t) (message . t) (notify . (NONE OWNER OWNER_REVIEWERS ALL)))
+  "Gerrit push options, as an alist of (OPTION . VALUES).
+VALUES is nil for flags, t for free text values or a list of
+possible values.")
+
+
+;;; Gerrit SSH commands
 
 (defun magit-gerrit--command (cmd &rest args)
   "Build SSH parameters to run Gerrit's CMD with ARGS."
@@ -154,22 +215,11 @@ parameter of `magit-insert-section'."
     ,cmd
     ,@(seq-filter #'identity (flatten-list args))))
 
-;; https://gerrit-review.googlesource.com/Documentation/user-search.html
-;; For example we can set it to: "(status:open OR (status:merged AND -age:6months))"
-(defvar-local magit-gerrit-query-filters nil)
-(defvar magit-gerrit-query-filters-history nil)
-(add-to-list 'savehist-additional-variables 'magit-gerrit-query-filters-history)
-
-(defun magit-gerrit-edit-filters (arg)
-  "Edit the Gerrit query filters.
-Edit globally when called with universal argument."
-  (interactive "P")
-  (when-let* ((filters (read-string "Query filters: " magit-gerrit-query-filters 'magit-gerrit-query-filters-history))
-              ((not (string-empty-p filters))))
-    (kill-local-variable 'magit-gerrit-query-filters)
-    (if arg
-        (setq-default magit-gerrit-query-filters filters)
-      (setq-local magit-gerrit-query-filters filters))))
+(defun magit-gerrit--ssh-cmd (cmd &rest args)
+  "Call Gerrit's command CMD with ARGS via SSH."
+  (apply #'call-process
+         "ssh" nil nil nil
+         (apply #'magit-gerrit--command cmd args)))
 
 (defun magit-gerrit--query (&optional prj)
   "Query project PRJ using `magit-gerrit-query-filters' or `status:open'."
@@ -184,13 +234,55 @@ Edit globally when called with universal argument."
          (shell-quote-argument magit-gerrit-query-filters)
        "status:open"))))
 
-(defun magit-gerrit--ssh-cmd (cmd &rest args)
-  "Call Gerrit's command CMD with ARGS via SSH."
-  (apply #'call-process
-         "ssh" nil nil nil
-         (apply #'magit-gerrit--command cmd args)))
+(defun magit-gerrit--review-submit (prj rev &optional msg)
+  "Submit change REV for merging on PRJ with optional message MSG."
+  (magit-gerrit--ssh-cmd "review" "--project" prj "--submit" (or msg "") rev))
 
-(defvar magit-gerrit--rev-change-id-cache (make-hash-table :test #'equal))
+(defun magit-gerrit--code-review (prj rev score &optional msg)
+  "Set code-review SCORE for REV on PRJ, with optional MSG."
+  (magit-gerrit--ssh-cmd "review" "--project" prj "--code-review" score (or msg "") rev))
+
+(defun magit-gerrit--review-verify (prj rev score &optional msg)
+  "Set verified SCORE for REV on PRJ, with optional MSG."
+  (magit-gerrit--ssh-cmd "review" "--project" prj "--verified" score (or msg "") rev))
+
+
+;;; Remote and project
+
+(defun magit-gerrit-get-remote-url ()
+  "Return the URL of the Gerrit remote."
+  (when-let* ((remote (cl-find-if (lambda (r) (member r (list magit-gerrit-remote magit-gerrit-fallback-remote)))
+                                  (magit-git-lines "remote"))))
+    (setq-local magit-gerrit-remote remote)
+    (magit-git-string
+     (if magit-gerrit-use-push-url
+         '("remote" "get-url" "--push")
+       '("ls-remote" "--get-url"))
+     remote)))
+
+(defun magit-gerrit-get-project ()
+  "Get the Gerrit project name for the current repo."
+  (when-let* ((url (magit-gerrit-get-remote-url))
+              (url (url-generic-parse-url url))
+              (prj (url-filename url)))
+    (string-trim-right (string-trim-left prj "/") "\\.git")))
+
+(defun magit-gerrit-detect-ssh-creds (remote-url)
+  "Derive `magit-gerrit-ssh-creds' from REMOTE-URL.
+Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
+`magit-gerrit-port' or when `magit-gerrit-force-enable' is non-nil."
+  (prog1 (or magit-gerrit-ssh-creds
+             (when-let* ((url (url-generic-parse-url remote-url))
+                         (user (url-user url))
+                         (host (url-host url))
+                         ((and (string= "ssh" (url-type url))
+                               (or magit-gerrit-force-enable (eq magit-gerrit-port (url-port url))))))
+               (setq-local magit-gerrit-ssh-creds (format "%s@%s" user host))))
+    (let ((inhibit-message t))
+      (message "Detected magit-gerrit-ssh-creds=%s" magit-gerrit-ssh-creds))))
+
+
+;;; Change-Id
 
 (defun magit-gerrit-commit-change-id (&optional rev)
   "Return Change-Id for REV or the commit at point."
@@ -201,8 +293,6 @@ Edit globally when called with universal argument."
       (when-let* ((id (magit-git-string "show" "--format=%(trailers:key=Change-Id,valueonly)" rev)))
         (puthash rev id magit-gerrit--rev-change-id-cache)
         id))))
-
-(defvar magit-gerrit--change-id-cache (make-hash-table :test #'equal))
 
 (defun magit-gerrit--get-change-id-info (id &optional invalidate-cache)
   "Return information about Change-Id ID.
@@ -221,14 +311,8 @@ When INVALIDATE-CACHE is non-nil, don't used cached values."
         (puthash id vals magit-gerrit--change-id-cache))
       vals)))
 
-(defun magit-gerrit-change-id-browse-url (&optional id)
-  "Go to the change ID's Gerrit URL."
-  (interactive (list (magit-gerrit-commit-change-id)))
-  (when-let* ((vals (magit-gerrit--get-change-id-info id))
-              (vals (seq-filter #'identity (mapcar (apply-partially #'alist-get 'url) vals))))
-    (browse-url (if (length= vals 1)
-                    (car vals)
-                  (completing-read "Select URL: " vals)))))
+
+;;; Gitiles
 
 (defun magit-gerrit--get-gitiles-link (&optional line-number)
   "Get Gitiles link, optionally with LINE-NUMBER."
@@ -244,61 +328,19 @@ When INVALIDATE-CACHE is non-nil, don't used cached values."
               (file-name (file-relative-name file-name (project-root proj))))
     (concat base-url "/" gerrit-proj "/+/refs/heads/" branch "/" file-name (when line-number (format "#%d" line-number)))))
 
-(defun magit-gerrit-gitiles-browse-url (with-line-p)
-  "Brwose this file in Gitiles, highlight current line when WITH-LINE-P."
-  (interactive "P")
-  (when-let* ((url (magit-gerrit--get-gitiles-link (when with-line-p (line-number-at-pos (point))))))
-    (browse-url url)))
 
-(defun magit-gerrit--review-submit (prj rev &optional msg)
-  "Submit change REV for merging on PRJ with optional message MSG."
-  (magit-gerrit--ssh-cmd "review" "--project" prj "--submit" (or msg "") rev))
-
-(defun magit-gerrit--code-review (prj rev score &optional msg)
-  "Set code-review SCORE for REV on PRJ, with optional MSG."
-  (magit-gerrit--ssh-cmd "review" "--project" prj "--code-review" score (or msg "") rev))
-
-(defun magit-gerrit--review-verify (prj rev score &optional msg)
-  "Set verified SCORE for REV on PRJ, with optional MSG."
-  (magit-gerrit--ssh-cmd "review" "--project" prj "--verified" score (or msg "") rev))
-
-(defun magit-gerrit-get-remote-url ()
-  "Returns remote URL."
-  (when-let* ((remote (cl-find-if (lambda (r) (member r (list magit-gerrit-remote magit-gerrit-fallback-remote)))
-                                  (magit-git-lines "remote"))))
-    (setq-local magit-gerrit-remote remote)
-    (magit-git-string
-     (if magit-gerrit-use-push-url
-         '("remote" "get-url" "--push")
-       '("ls-remote" "--get-url"))
-     remote)))
-
-(defun magit-gerrit-get-project ()
-  "Get the Gerrit project name for the current repo."
-  (when-let* ((url (magit-gerrit-get-remote-url))
-              (url (url-generic-parse-url url))
-              (prj (url-filename url)))
-    (string-trim-right (string-trim-left prj "/") "\\.git")))
+;;; Formatting
 
 (defun magit-gerrit-string-real-length (s)
+  "Return the display length of string S."
   (if (multibyte-string-p s)
       (let* ((mm (- (string-bytes s) (length s)))
              (n (- (length s) (/ mm 2))))
         (+ mm n))
     (length s)))
 
-(defun magit-gerrit-create-branch-force (branch parent)
-  "Switch 'HEAD' to new BRANCH at revision PARENT and update working tree.
-Fails if working tree or staging area contain uncommitted changes.
-Succeed even if branch already exist
-\('git checkout -B BRANCH REVISION')."
-  (cond ((run-hook-with-args-until-success
-          'magit-create-branch-hook branch parent))
-        ((and branch (not (string= branch "")))
-         (magit-save-repository-buffers)
-         (magit-run-git "checkout" "-B" branch parent))))
-
 (defun magit-gerrit-format-short-timestring (seconds)
+  "Format SECONDS as a short human readable duration."
   (let* ((years  (/ seconds 32140800))
          (months (/ seconds 2678400))
          (days (/ seconds 86400))
@@ -312,7 +354,15 @@ Succeed even if branch already exist
      ((> minutes 1) (format "%2d %s" minutes (if (> minutes 2) "minutes" "minute")))
      (t "just now"))))
 
+(defun magit-gerrit-create-review-labels ()
+  "Create review labels heading."
+  (let* ((review-labels ""))
+    (dolist (label-tuple magit-gerrit-review-labels review-labels)
+      (setq review-labels (concat review-labels (car (cdr label-tuple)) " ")))
+    (string-trim-right review-labels)))
+
 (defun magit-gerrit-pretty-print-review-header ()
+  "Return the header line of the reviews section."
   (let* ((wid (window-width))
          ;; number
          (numstr (format "%-13s" "Patchset"))
@@ -348,6 +398,12 @@ Succeed even if branch already exist
     (propertize (format "%s\n" show-str) 'font-lock-face 'highlight)))
 
 (defun magit-gerrit-pretty-print-review (num patchsetn subj owner-name br size-i size-d ctime approvals-info &optional draft)
+  "Return the line of a review.
+NUM is the change number, PATCHSETN the patchset number, SUBJ the
+subject, OWNER-NAME the owner, BR the branch, SIZE-I and SIZE-D the
+inserted and deleted lines, CTIME the last update time and
+APPROVALS-INFO the formatted approvals.  When DRAFT is non-nil, the
+subject is dimmed."
   (let* ((wid (window-width)) ; to prevents long line arrow from being shown
          ;; number
          (numstr (propertize (format "%-8s" num) 'font-lock-face 'magit-hash))
@@ -406,6 +462,7 @@ Succeed even if branch already exist
     (nreverse matchlist)))
 
 (defun magit-gerrit-trans-score (type value-list)
+  "Format the votes VALUE-LIST of label TYPE as a single character."
   (if (and value-list (length> value-list 0))
       (let ((min-v (apply 'min value-list))
             (max-v (apply 'max value-list))
@@ -421,6 +478,7 @@ Succeed even if branch already exist
     " "))
 
 (defun magit-gerrit-wash-approvals-oneline (approvals)
+  "Format APPROVALS on one line, one column per review label."
   (let* (type-values)
     (seq-doseq (approval approvals)
       (let ((type (cdr (assq 'type approval)))
@@ -429,14 +487,17 @@ Succeed even if branch already exist
     (mapconcat
      (lambda (elem)
        (let* ((long (car elem))
-              (short (cadr elem))
               (score (magit-gerrit-trans-score
                       long (cdr (assoc long type-values)))))
          (format "%2s" score)))
      magit-gerrit-review-labels
      " ")))
 
+
+;;; Status section
+
 (defun magit-gerrit-wash-review ()
+  "Wash one review from the JSON output of a Gerrit query."
   (let* ((beg (point))
          (jobj (json-read))
          (end (point))
@@ -445,7 +506,6 @@ Succeed even if branch already exist
          (br (cdr-safe (assoc 'branch jobj)))
          (owner (cdr-safe (assoc 'owner jobj)))
          (owner-name (cdr-safe (assoc 'name owner)))
-         ;; (owner-email (cdr-safe (assoc 'email owner)))
          (patchsets (cdr-safe (assoc 'currentPatchSet jobj)))
          (patchset-num (cdr-safe (assoc 'number patchsets)))
          (last-update (cdr-safe (assoc 'lastUpdated jobj)))
@@ -470,16 +530,11 @@ Succeed even if branch already exist
       t)))
 
 (defun magit-gerrit-wash-reviews (&rest _args)
+  "Wash the JSON output of a Gerrit query."
   (magit-wash-sequence #'magit-gerrit-wash-review))
 
-(defun magit-gerrit-create-review-labels ()
-  "Create review labels heading."
-  (let* ((review-labels ""))
-    (dolist (label-tuple magit-gerrit-review-labels review-labels)
-      (setq review-labels (concat review-labels (car (cdr label-tuple)) " ")))
-    (string-trim-right review-labels)))
-
 (defun magit-gerrit-section (_section title washer &rest args)
+  "Insert a section titled TITLE, filled by WASHER using ssh ARGS."
   (let ((magit-git-executable "ssh")
         (magit-remote-git-executable "ssh")
         (magit-git-global-arguments nil))
@@ -489,18 +544,43 @@ Succeed even if branch already exist
       (magit-git-wash washer (split-string (car args)))
       (insert "\n"))))
 
+(defun magit-gerrit-insert-reviews-section ()
+  "Insert the Gerrit reviews section in the status buffer."
+  (magit-gerrit-section 'gerrit-reviews "Reviews:" 'magit-gerrit-wash-reviews (string-join (magit-gerrit--query) " ")))
+
+
+;;; Patchsets
+
 ;; Not yet implemented, could be if necessary
-(defun magit-gerrit-remote-update (&optional _remote))
-(defun magit-gerrit-create-branch (_branch _parent))
+(defun magit-gerrit-remote-update (&optional _remote)
+  "Not implemented.")
+
+(defun magit-gerrit-create-branch (_branch _parent)
+  "Not implemented.")
 
 (defun magit-gerrit-review-at-point ()
+  "Return the review at point."
   (get-text-property (point) 'magit-gerrit-jobj))
 
 (defsubst magit-gerrit-process-wait ()
+  "Wait for the current Magit process to finish."
   (while (and magit-this-process (eq (process-status magit-this-process) 'run))
     (sleep-for 0.005)))
 
+(defun magit-gerrit-create-branch-force (branch parent)
+  "Switch HEAD to new BRANCH at revision PARENT and update working tree.
+Fails if working tree or staging area contain uncommitted changes.
+Succeed even if branch already exist
+\(\"git checkout -B BRANCH REVISION\")."
+  (cond ((run-hook-with-args-until-success
+          'magit-create-branch-hook branch parent))
+        ((and branch (not (string= branch "")))
+         (magit-save-repository-buffers)
+         (magit-run-git "checkout" "-B" branch parent))))
+
 (defun magit-gerrit-get-ref (&optional select-number)
+  "Return the ref of the review at point.
+When SELECT-NUMBER is non-nil, ask for the patchset number."
   (when-let* ((jobj (magit-gerrit-review-at-point))
               (curr-patchset (assoc 'currentPatchSet jobj))
               (ref (cdr (assoc 'ref curr-patchset)))
@@ -518,6 +598,35 @@ Succeed even if branch already exist
     (magit-git-fetch magit-gerrit-remote ref)
     (message (format "Waiting a git fetch from %s to complete..." magit-gerrit-remote))
     (magit-gerrit-process-wait)))
+
+
+;;; Commands
+
+(defun magit-gerrit-edit-filters (arg)
+  "Edit the Gerrit query filters.
+Edit globally when called with universal argument ARG."
+  (interactive "P")
+  (when-let* ((filters (read-string "Query filters: " magit-gerrit-query-filters 'magit-gerrit-query-filters-history))
+              ((not (string-empty-p filters))))
+    (kill-local-variable 'magit-gerrit-query-filters)
+    (if arg
+        (setq-default magit-gerrit-query-filters filters)
+      (setq-local magit-gerrit-query-filters filters))))
+
+(defun magit-gerrit-change-id-browse-url (&optional id)
+  "Go to the Gerrit URL of the change with Change-Id ID."
+  (interactive (list (magit-gerrit-commit-change-id)))
+  (when-let* ((vals (magit-gerrit--get-change-id-info id))
+              (vals (seq-filter #'identity (mapcar (apply-partially #'alist-get 'url) vals))))
+    (browse-url (if (length= vals 1)
+                    (car vals)
+                  (completing-read "Select URL: " vals)))))
+
+(defun magit-gerrit-gitiles-browse-url (with-line-p)
+  "Browse this file in Gitiles, highlight current line when WITH-LINE-P."
+  (interactive "P")
+  (when-let* ((url (magit-gerrit--get-gitiles-link (when with-line-p (line-number-at-pos (point))))))
+    (browse-url url)))
 
 (defun magit-gerrit-view-patchset-diff (&optional select-number)
   "View the diff for a patchset, optionally SELECT-NUMBER."
@@ -585,9 +694,6 @@ Succeed even if branch already exist
         (message "Copied %S to clipboard." ref))
     (user-error "No Gerrit revision at point")))
 
-(defun magit-gerrit-insert-reviews-section ()
-  (magit-gerrit-section 'gerrit-reviews "Reviews:" 'magit-gerrit-wash-reviews (string-join (magit-gerrit--query) " ")))
-
 (defun magit-gerrit-add-reviewer ()
   "Add a reviewer to the review at point."
   (interactive)
@@ -598,11 +704,12 @@ Succeed even if branch already exist
    (cdr-safe (assoc 'id (magit-gerrit-review-at-point)))))
 
 (defun magit-gerrit-arguments ()
+  "Return the arguments of the `magit-gerrit-dispatch' transient."
   (or (transient-args 'magit-gerrit-dispatch)
       (list "")))
 
 (defun magit-gerrit-verify-review (args)
-  "Verify a Gerrit review."
+  "Verify a Gerrit review, using transient ARGS."
   (interactive (magit-gerrit-arguments))
   (let ((score (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1"))
         (rev (cdr-safe (assoc
@@ -614,7 +721,7 @@ Succeed even if branch already exist
     (magit-refresh)))
 
 (defun magit-gerrit-code-review (args)
-  "Perform a Gerrit code review."
+  "Perform a Gerrit code review, using transient ARGS."
   (interactive (magit-gerrit-arguments))
   (let ((score (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1"))
         (rev (cdr-safe (assoc
@@ -626,7 +733,7 @@ Succeed even if branch already exist
     (magit-refresh)))
 
 (defun magit-gerrit-submit-review (args)
-  "Submit a Gerrit code review."
+  "Submit a Gerrit code review, using transient ARGS."
   (interactive (magit-gerrit-arguments))
   (let ((prj (magit-gerrit-get-project))
         (rev (cdr-safe (assoc 'revision (cdr-safe (assoc 'currentPatchSet (magit-gerrit-review-at-point)))))))
@@ -634,11 +741,33 @@ Succeed even if branch already exist
     (magit-fetch-all-no-prune)
     (magit-refresh)))
 
-(defconst magit-gerrit-push-options
-  '((wip) (ready) (private) (remove-private) (publish-comments)
-    (hashtag . t) (topic . t) (message . t) (notify . (NONE OWNER OWNER_REVIEWERS ALL))))
+(defun magit-gerrit-abandon-review ()
+  "Abandon the review at point."
+  (interactive)
+  (let ((prj (magit-gerrit-get-project))
+        (rev (cdr-safe (assoc
+                        'revision
+                        (cdr-safe (assoc 'currentPatchSet
+                                         (magit-gerrit-review-at-point)))))))
+    (magit-gerrit--ssh-cmd "review" "--project" prj "--abandon" rev)
+    (magit-refresh)))
+
+(defun magit-gerrit-restore-review ()
+  "Restore the abandoned review at point."
+  (interactive)
+  (let ((prj (magit-gerrit-get-project))
+        (rev (cdr-safe (assoc
+                        'revision
+                        (cdr-safe (assoc 'currentPatchSet
+                                         (magit-gerrit-review-at-point)))))))
+    (magit-gerrit--ssh-cmd "review" "--project" prj "--restore" rev)
+    (magit-refresh)))
+
+
+;;; Push
 
 (defun magit-gerrit-read-push-option ()
+  "Read a Gerrit push option, see `magit-gerrit-push-options'."
   (let* ((option (intern (completing-read "Select an option: " magit-gerrit-push-options nil t)))
          (choice (alist-get option magit-gerrit-push-options))
          (prompt (format "Value for option %S: " option))
@@ -648,6 +777,7 @@ Succeed even if branch already exist
     (concat "%" (format "%s" option) (when val (format "=%s" val)))))
 
 (defun magit-gerrit-push-review (status &optional option)
+  "Push the commit at point to refs/STATUS/<branch> with push OPTION."
   (let* ((branch (magit-get-current-branch))
          (branch-remote (and branch (magit-get "branch" branch "remote")))
          (branch-remote (and (not (or (null branch-remote) (string= branch-remote "."))) branch-remote)))
@@ -670,38 +800,26 @@ Succeed even if branch already exist
       (unless branch-remote (setq branch-remote magit-gerrit-remote))
       (magit-run-git-async "push" "-v" (when magit-gerrit-signed-push-p "--signed") branch-remote (concat rev ":" branch-pub option)))))
 
-(define-obsolete-function-alias 'magit-gerrit-create-review 'magit-gerrit-push-for-review "1.0.0")
-(define-obsolete-function-alias 'magit-gerrit-create-draft 'magit-gerrit-push-draft-for-review "1.0.0")
-
 (defun magit-gerrit-push-for-review (&optional with-opt)
+  "Push the commit at point for review.
+When WITH-OPT is non-nil, ask for a push option."
   (interactive "P")
   (magit-gerrit-push-review 'for (when with-opt (magit-gerrit-read-push-option))))
 
 (defun magit-gerrit-push-draft-for-review (&optional with-opt)
+  "Push the commit at point as a draft for review.
+When WITH-OPT is non-nil, ask for a push option."
   (interactive "P")
   (magit-gerrit-push-review 'drafts (when with-opt (magit-gerrit-read-push-option))))
 
-(defun magit-gerrit-abandon-review ()
-  (interactive)
-  (let ((prj (magit-gerrit-get-project))
-        (rev (cdr-safe (assoc
-                        'revision
-                        (cdr-safe (assoc 'currentPatchSet
-                                         (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--ssh-cmd "review" "--project" prj "--abandon" rev)
-    (magit-refresh)))
+(define-obsolete-function-alias 'magit-gerrit-create-review 'magit-gerrit-push-for-review "1.0.0")
+(define-obsolete-function-alias 'magit-gerrit-create-draft 'magit-gerrit-push-draft-for-review "1.0.0")
 
-(defun magit-gerrit-restore-review ()
-  (interactive)
-  (let ((prj (magit-gerrit-get-project))
-        (rev (cdr-safe (assoc
-                        'revision
-                        (cdr-safe (assoc 'currentPatchSet
-                                         (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--ssh-cmd "review" "--project" prj "--restore" rev)
-    (magit-refresh)))
+
+;;; Transient
 
 (defun magit-gerrit-read-message (&rest _args)
+  "Read a review message."
   (format "\'%s\'" (read-from-minibuffer "Message: ")))
 
 (transient-define-argument magit-gerrit--transient-arg-message ()
@@ -735,12 +853,17 @@ Succeed even if branch already exist
    ("Y" "Copy review URL and message"      magit-gerrit-copy-review-url-commit-message)
    ("r" "Copy review reference (hash)"     magit-gerrit-copy-ref)])
 
+
+;;; Minor mode
+
 (defvar magit-gerrit-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map magit-gerrit-popup-prefix 'magit-gerrit-dispatch)
-    map))
+    map)
+  "Keymap of `magit-gerrit-mode'.")
 
-(define-minor-mode magit-gerrit-mode "Gerrit support for Magit"
+(define-minor-mode magit-gerrit-mode
+  "Gerrit support for Magit."
   :lighter " Gerrit" :require 'magit-topgit :keymap magit-gerrit-mode-map
   (unless (derived-mode-p 'magit-mode)
     (user-error "This mode only makes sense with magit"))
@@ -779,24 +902,8 @@ Succeed even if branch already exist
   (when (called-interactively-p 'any)
     (magit-refresh)))
 
-(defun magit-gerrit-detect-ssh-creds (remote-url)
-  "Derive `magit-gerrit-ssh-creds' from REMOTE-URL.
-Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
-`magit-gerrit-port' or when `magit-gerrit-force-enable' is non-nil."
-  (prog1 (or magit-gerrit-ssh-creds
-             (when-let* ((url (url-generic-parse-url remote-url))
-                         (user (url-user url))
-                         (host (url-host url))
-                         ((and (string= "ssh" (url-type url))
-                               (or magit-gerrit-force-enable (eq magit-gerrit-port (url-port url))))))
-               (setq-local magit-gerrit-ssh-creds (format "%s@%s" user host))))
-    (let ((inhibit-message t))
-      (message "Detected magit-gerrit-ssh-creds=%s" magit-gerrit-ssh-creds))))
-
-(defvar magit-gerrit--origin-action nil)
-(defvar magit-gerrit--dispatch-is-added nil)
-
 (defun magit-gerrit-check-enable ()
+  "Enable `magit-gerrit-mode' when the repository is hosted on Gerrit."
   (let ((remote-url (magit-gerrit-get-remote-url)))
     (when (and remote-url
                (or magit-gerrit-force-enable
