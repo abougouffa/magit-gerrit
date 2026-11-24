@@ -135,6 +135,21 @@ KEY can be a vector, a raw key string or a `kbd'-style string."
   "Keymap of `magit-gerrit-mode'.
 The key opening `magit-gerrit-dispatch' is `magit-gerrit-popup-prefix'.")
 
+(defcustom magit-gerrit-label-values
+  '(("Code-Review" -2 . 2) ("Verified" -1 . 1))
+  "Range of the values of the review labels, as (LABEL MIN . MAX).
+Gerrit's SSH interface doesn't tell which values a label accepts, add
+the custom labels of your projects here.  Labels not listed here use
+`magit-gerrit-default-label-values'."
+  :group 'magit-gerrit
+  :type '(alist :key-type (string :tag "Label")
+                :value-type (cons (integer :tag "Min") (integer :tag "Max"))))
+
+(defcustom magit-gerrit-default-label-values '(-1 . 1)
+  "Range of the values of labels missing from `magit-gerrit-label-values'."
+  :group 'magit-gerrit
+  :type '(cons (integer :tag "Min") (integer :tag "Max")))
+
 (defcustom magit-gerrit-popup-prefix "_"
   "Key used to open the `magit-gerrit-dispatch' transient.
 Set it with the Customize interface or `setopt' (or `setq' before
@@ -350,12 +365,16 @@ Uses `magit-gerrit-query-filters' or \"status:open\"."
 (defun magit-gerrit--fetch-reviews ()
   "Fetch the reviews of the current project."
   (when-let* ((terms (magit-gerrit--query-terms)))
-    (magit-gerrit--query-changes terms "--current-patch-set")))
+    (magit-gerrit--query-changes terms "--current-patch-set" "--submit-records")))
 
 (defun magit-gerrit--message-args (args)
-  "Return the \"--message\" arguments from the transient ARGS."
-  (when-let* ((msg (transient-arg-value "--message=" args)))
-    (list "--message" msg)))
+  "Return the \"gerrit review\" arguments from the transient ARGS.
+These are the message and the notification setting."
+  (append
+   (when-let* ((msg (transient-arg-value "--message=" args)))
+     (list "--message" msg))
+   (when-let* ((notify (transient-arg-value "--notify=" args)))
+     (list "--notify" notify))))
 
 (defun magit-gerrit--review (change &rest args)
   "Run \"gerrit review\" on the current patchset of CHANGE with ARGS."
@@ -642,15 +661,19 @@ the face of the subject."
    (magit-gerrit-wash-approvals-oneline (magit-gerrit-change-approvals change))
    (if (magit-gerrit-change-wip-p change) 'magit-dimmed 'magit-filename)))
 
+(defun magit-gerrit--label-range (label)
+  "Return the range of the values of LABEL, as (MIN . MAX)."
+  (or (cdr (assoc label magit-gerrit-label-values))
+      magit-gerrit-default-label-values))
+
 (defun magit-gerrit-trans-score (type value-list)
   "Format the votes VALUE-LIST of label TYPE as a single character."
   (if (and value-list (length> value-list 0))
-      (let ((min-v (apply #'min value-list))
-            (max-v (apply #'max value-list))
-            (t-max-v 1)
-            (t-min-v -1))
-        (if (string= "Code-Review" type)
-            (setq t-max-v 2 t-min-v -2))
+      (let* ((min-v (apply #'min value-list))
+             (max-v (apply #'max value-list))
+             (range (magit-gerrit--label-range type))
+             (t-min-v (car range))
+             (t-max-v (cdr range)))
         (cond
          ((<= min-v t-min-v) (propertize "x" 'font-lock-face 'magit-signature-bad))
          ((>= max-v t-max-v) (propertize "✓" 'font-lock-face 'magit-signature-good))
@@ -861,25 +884,54 @@ Edit globally when called with universal argument ARG."
   "Return the arguments of the `magit-gerrit-dispatch' transient."
   (transient-args 'magit-gerrit-dispatch))
 
-(defun magit-gerrit--read-score ()
-  "Read a review score."
-  (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1"))
+(defun magit-gerrit--label-votes (label)
+  "Return the possible votes for LABEL, as \"LABEL=VALUE\" strings."
+  (let ((range (magit-gerrit--label-range label)))
+    (mapcar (lambda (value)
+              (format "%s=%s" label (if (> value 0) (format "+%d" value) value)))
+            (number-sequence (cdr range) (car range) -1))))
 
-(defun magit-gerrit-verify-review (args)
-  "Verify a Gerrit review, using transient ARGS."
-  (interactive (list (magit-gerrit-arguments)))
+(defun magit-gerrit--read-votes (change &optional label)
+  "Read votes on CHANGE, as a list of \"LABEL=VALUE\" strings.
+When LABEL is non-nil, read a single vote for this label."
+  (if label
+      (list (completing-read "Vote: " (magit-gerrit--label-votes label) nil t))
+    (completing-read-multiple "Votes (LABEL=VALUE, comma separated): "
+                              (mapcan #'magit-gerrit--label-votes
+                                      (magit-gerrit--change-labels change))
+                              nil t)))
+
+(defun magit-gerrit-vote (votes args)
+  "Vote VOTES on the change at point, using transient ARGS.
+VOTES is a list of \"LABEL=VALUE\" strings; interactively, they are
+read with completion among the labels of the change and their values
+\(see `magit-gerrit-label-values').  With the \"--submit\" argument,
+submit the change after voting."
+  (interactive (let ((change (magit-gerrit--change-at-point-or-error)))
+                 (list (magit-gerrit--read-votes change) (magit-gerrit-arguments))))
+  (unless votes
+    (user-error "No vote"))
   (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
-                        "--verified" (magit-gerrit--read-score)
-                        (magit-gerrit--message-args args))
+                        (mapcar (lambda (vote) (list "--label" vote)) votes)
+                        (magit-gerrit--message-args args)
+                        (when (member "--submit" args) "--submit"))
+  (when (member "--submit" args)
+    (magit-fetch-all-no-prune))
   (magit-refresh))
 
 (defun magit-gerrit-code-review (args)
-  "Perform a Gerrit code review, using transient ARGS."
+  "Vote on the Code-Review label of the change at point, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
-                        "--code-review" (magit-gerrit--read-score)
-                        (magit-gerrit--message-args args))
-  (magit-refresh))
+  (magit-gerrit-vote (magit-gerrit--read-votes (magit-gerrit--change-at-point-or-error)
+                                               "Code-Review")
+                     args))
+
+(defun magit-gerrit-verify-review (args)
+  "Vote on the Verified label of the change at point, using transient ARGS."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit-vote (magit-gerrit--read-votes (magit-gerrit--change-at-point-or-error)
+                                               "Verified")
+                     args))
 
 (defun magit-gerrit-submit-review (args)
   "Submit a Gerrit code review, using transient ARGS."
@@ -1281,7 +1333,10 @@ Interactively, show the change at point or read its number."
 (transient-define-prefix magit-gerrit-dispatch ()
   "Transient menu for `magit-gerrit' commands."
   ["Arguments"
-   ("-m" "Message"                         "--message=")]
+   ("-m" "Message"                         "--message=")
+   ("-n" "Notify"                          "--notify="
+    :choices ("NONE" "OWNER" "OWNER_REVIEWERS" "ALL"))
+   ("-s" "Submit after voting"             "--submit")]
   [["Actions"
     ("A" "Add reviewer"                    magit-gerrit-add-reviewer)
     ("B" "Abandon review"                  magit-gerrit-abandon-review)
@@ -1292,11 +1347,10 @@ Interactively, show the change at point or read its number."
    ["Review"
     ("RET" "Show change"                   magit-gerrit-show-change)
     ("b" "Browse review"                   magit-gerrit-browse-review)
-    ("C" "Code review"                     magit-gerrit-code-review)
+    ("v" "Vote"                            magit-gerrit-vote)
     ("d" "View patchset diff"              magit-gerrit-view-patchset-diff)
     ("D" "Download patchset"               magit-gerrit-download-patchset)
-    ("F" "Cherry-pick patchset"            magit-gerrit-cherry-pick-patchset)
-    ("V" "Verify"                          magit-gerrit-verify-review)]]
+    ("F" "Cherry-pick patchset"            magit-gerrit-cherry-pick-patchset)]]
   ["Others"
    ("y" "Copy review URL"                  magit-gerrit-copy-review-url)
    ("Y" "Copy review URL and message"      magit-gerrit-copy-review-url-commit-message)
