@@ -40,16 +40,16 @@
 ;; (setq-default magit-gerrit-ssh-creds "myid@gerrithost.org")
 
 ;; M-x `magit-status'
-;; h R <= magit-gerrit uses the R prefix, see help
+;; _ <= magit-gerrit uses the _ prefix (see `magit-gerrit-popup-prefix')
 
 
 ;;; Workflow:
 
 ;; 1) *check out branch => changes => (ma)git commit*
-;; 2) R P  <= [ger*R*it *P*ush for review]
-;; 3) R A  <= [ger*R*it *A*dd reviewer] (by email address)
+;; 2) _ P  <= [*P*ush for review]
+;; 3) _ A  <= [*A*dd reviewer] (by email address)
 ;; 4) *wait for verification/code reviews* [approvals shown in status]
-;; 5) R S  <= [ger*R*it *S*ubmit review]
+;; 5) _ S  <= [*S*ubmit review]
 
 
 ;;; Other Comments:
@@ -62,7 +62,7 @@
 ;; `magit-gerrit-remote' should be adjusted accordingly (e.g. "gerrit")
 
 ;; Recommended to auto add reviewers via git hooks (precommit), rather
-;; than manually performing 'R A' for every review.
+;; than manually performing '_ A' for every review.
 
 ;; `magit-gerrit' will be enabled automatically on `magit-status' if
 ;; the git remote repo uses the same creds found in
@@ -125,10 +125,30 @@ label name as displayed in the Gerrit UI and ABBREVIATION is a
   :type '(repeat (list (string :tag "Label")
                        (string :tag "Abbreviation"))))
 
+(defun magit-gerrit--key (key)
+  "Return KEY as a key vector.
+KEY can be a vector, a raw key string or a `kbd'-style string."
+  (if (and (stringp key) (key-valid-p key))
+      (key-parse key)
+    key))
+
+(defvar magit-gerrit-mode-map (make-sparse-keymap)
+  "Keymap of `magit-gerrit-mode'.
+The key opening `magit-gerrit-dispatch' is `magit-gerrit-popup-prefix'.")
+
 (defcustom magit-gerrit-popup-prefix "_"
-  "Key used to open the `magit-gerrit-dispatch' transient."
+  "Key used to open the `magit-gerrit-dispatch' transient.
+Set it with the Customize interface or `setopt' (or `setq' before
+loading `magit-gerrit') so that `magit-gerrit-mode-map' is updated."
   :group 'magit-gerrit
-  :type 'key-sequence)
+  :type 'key-sequence
+  :set (lambda (symbol value)
+         (when (and (boundp symbol) (symbol-value symbol))
+           (define-key magit-gerrit-mode-map
+                       (magit-gerrit--key (symbol-value symbol)) nil t))
+         (set-default-toplevel-value symbol value)
+         (define-key magit-gerrit-mode-map
+                     (magit-gerrit--key value) #'magit-gerrit-dispatch)))
 
 (defcustom magit-gerrit-signed-push-p nil
   "Whether or not to push with the --signed option."
@@ -194,12 +214,6 @@ See https://gerrit-review.googlesource.com/Documentation/user-search.html")
 
 (defvar magit-gerrit--change-id-cache (make-hash-table :test #'equal)
   "Cache mapping Change-Ids to Gerrit query results.")
-
-(defvar magit-gerrit--origin-action nil
-  "Command bound to `magit-gerrit-popup-prefix' before enabling the mode.")
-
-(defvar magit-gerrit--dispatch-is-added nil
-  "Non-nil when the Gerrit entry has been added to `magit-dispatch'.")
 
 (defconst magit-gerrit-log-buffer-name "*magit-gerrit-log*"
   "Name of the buffer logging the Gerrit SSH commands.")
@@ -696,6 +710,10 @@ subject is dimmed."
                 (magit-gerrit-change-approvals change))
                (magit-gerrit-change-wip-p change))))))
 
+(defvar-keymap magit-gerrit-change-section-map
+  :doc "Keymap for the sections of Gerrit changes."
+  "<remap> <magit-visit-thing>" #'magit-gerrit-browse-review)
+
 (defun magit-gerrit-insert-reviews-section ()
   "Insert the Gerrit reviews section in the status buffer.
 Errors are displayed in the section instead of aborting the refresh."
@@ -712,13 +730,6 @@ Errors are displayed in the section instead of aborting the refresh."
 
 
 ;;; Patchsets
-
-;; Not yet implemented, could be if necessary
-(defun magit-gerrit-remote-update (&optional _remote)
-  "Not implemented.")
-
-(defun magit-gerrit-create-branch (_branch _parent)
-  "Not implemented.")
 
 (defsubst magit-gerrit-process-wait ()
   "Wait for the current Magit process to finish."
@@ -995,51 +1006,40 @@ When WITH-OPT is non-nil, ask for a push option."
 
 ;;; Minor mode
 
-(defvar magit-gerrit-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map magit-gerrit-popup-prefix 'magit-gerrit-dispatch)
-    map)
-  "Keymap of `magit-gerrit-mode'.")
-
+;;;###autoload
 (define-minor-mode magit-gerrit-mode
-  "Gerrit support for Magit."
-  :lighter " Gerrit" :require 'magit-topgit :keymap magit-gerrit-mode-map
-  (unless (derived-mode-p 'magit-mode)
-    (user-error "This mode only makes sense with magit"))
-  (if-let* ((url (magit-gerrit-get-remote-url)))
-      (unless (magit-gerrit-detect-ssh-creds url)
-        (user-error "You can set `magit-gerrit-ssh-creds' to enable magit-gerrit-mode"))
-    (user-error "You can set `magit-gerrit-remote' to a valid Gerrit remote"))
-  (if magit-gerrit-mode
-      (progn
-        (magit-add-section-hook 'magit-status-sections-hook
-                                'magit-gerrit-insert-reviews-section
-                                'magit-insert-stashes t t)
-        (add-hook 'magit-create-branch-command-hook 'magit-gerrit-create-branch nil t)
-        (add-hook 'magit-remote-update-command-hook 'magit-gerrit-remote-update nil t)
-        (add-hook 'magit-push-command-hook 'magit-gerrit-push nil t))
-    (remove-hook 'magit-after-insert-stashes-hook 'magit-gerrit-insert-reviews-section t)
-    (remove-hook 'magit-create-branch-command-hook 'magit-gerrit-create-branch t)
-    (remove-hook 'magit-remote-update-command-hook 'magit-gerrit-remote-update t)
-    (remove-hook 'magit-push-command-hook 'magit-gerrit-push t))
-  (when (not magit-gerrit--origin-action)
-    (setq magit-gerrit--origin-action (lookup-key magit-mode-map magit-gerrit-popup-prefix))
-    (if magit-gerrit-mode
-        (progn
-          ;; Update keymap with prefix incase it has changed
-          (define-key magit-mode-map magit-gerrit-popup-prefix 'magit-gerrit-dispatch)
-          (define-key magit-mode-map [remap magit-visit-thing] 'magit-gerrit-browse-review)
-          ;; Attach Magit Gerrit to Magit's default help popup
-          (when (not magit-gerrit--dispatch-is-added)
-            (transient-append-suffix 'magit-dispatch "z"
-              `(,magit-gerrit-popup-prefix "Gerrit" magit-gerrit-dispatch)))
-          (setq magit-gerrit--dispatch-is-added t))
-      (define-key magit-mode-map magit-gerrit-popup-prefix magit-gerrit--origin-action)
-      ;; Dettach Magit Gerrit to Magit's default help popup
-      (setq magit-gerrit--dispatch-is-added nil)
-      (transient-remove-suffix 'magit-dispatch magit-gerrit-popup-prefix)))
+  "Gerrit support for Magit.
+
+Add the Gerrit reviews section to the status buffer and bind
+`magit-gerrit-dispatch' to `magit-gerrit-popup-prefix'.
+
+\\{magit-gerrit-mode-map}"
+  :lighter " Gerrit"
+  :keymap magit-gerrit-mode-map
+  :group 'magit-gerrit
+  (if (not magit-gerrit-mode)
+      (remove-hook 'magit-status-sections-hook #'magit-gerrit-insert-reviews-section t)
+    (when-let* ((err (cond
+                      ((not (derived-mode-p 'magit-mode))
+                       "This mode only makes sense with magit")
+                      ((not (magit-gerrit-get-remote-url))
+                       "You can set `magit-gerrit-remote' to a valid Gerrit remote")
+                      ((not (magit-gerrit-detect-ssh-creds (magit-gerrit-get-remote-url)))
+                       "You can set `magit-gerrit-ssh-creds' to enable magit-gerrit-mode"))))
+      (setq magit-gerrit-mode nil)
+      (user-error "%s" err))
+    (magit-add-section-hook 'magit-status-sections-hook
+                            #'magit-gerrit-insert-reviews-section
+                            'magit-insert-stashes t t))
   (when (called-interactively-p 'any)
     (magit-refresh)))
+
+;; Show the Gerrit transient in `magit-dispatch' when the mode is enabled
+(unless (ignore-errors (transient-get-suffix 'magit-dispatch 'magit-gerrit-dispatch))
+  (ignore-errors
+    (transient-append-suffix 'magit-dispatch "z"
+      `(,(key-description (magit-gerrit--key magit-gerrit-popup-prefix)) "Gerrit" magit-gerrit-dispatch
+        :if-non-nil magit-gerrit-mode))))
 
 (defun magit-gerrit-check-enable ()
   "Enable `magit-gerrit-mode' when the repository is hosted on Gerrit."
@@ -1047,11 +1047,8 @@ When WITH-OPT is non-nil, ask for a push option."
     (when (and remote-url
                (or magit-gerrit-force-enable
                    (and (magit-gerrit-detect-ssh-creds remote-url)
-                        (string-match magit-gerrit-ssh-creds remote-url))))
+                        (string-search magit-gerrit-ssh-creds remote-url))))
       (magit-gerrit-mode 1))))
-
-;; Hack in dir-local variables that might be set for magit gerrit
-(add-hook 'magit-status-mode-hook #'hack-dir-local-variables-non-file-buffer t)
 
 ;;;###autoload
 (defun magit-gerrit-auto-enable ()

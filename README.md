@@ -49,10 +49,10 @@ Workflow
 --------
 
 1. Check out branch, make changes, and commit...
-2. Gerrit Push Commit for Code Review => R P
-3. Gerrit Add Reviewer => R A (optional)
+2. Gerrit Push Commit for Code Review => _ P
+3. Gerrit Add Reviewer => _ A (optional)
 4. Wait for code review and verification (approvals updated in magit-status)
-5. Gerrit Submit Review => R S
+5. Gerrit Submit Review => _ S
 
 
 Magit Gerrit Configuration
