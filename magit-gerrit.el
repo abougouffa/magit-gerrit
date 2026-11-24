@@ -819,20 +819,54 @@ The change whose current patchset is REV comes first."
 
 ;;; Gitiles
 
-(defun magit-gerrit--get-gitiles-link (&optional line-number)
-  "Get Gitiles link, optionally with LINE-NUMBER."
-  (when-let* ((gerrit-proj (magit-gerrit-get-project))
-              (base-url (or magit-gerrit-gitiles-base-url
-                            (when-let* ((remote-url (magit-gerrit-get-remote-url))
-                                        (url (url-generic-parse-url remote-url)))
-                              (concat "https://" (url-host url) "/plugins/gitiles"))))
-              (branch "master")
-              (file-name (buffer-file-name))
-              (toplevel (magit-toplevel))
-              (file-name (file-relative-name file-name toplevel)))
-    (concat base-url "/" gerrit-proj "/+/refs/heads/" branch "/" file-name
-            (when line-number (format "#%d" line-number)))))
+(defun magit-gerrit--gitiles-base-url ()
+  "Return the base URL of Gitiles, see `magit-gerrit-gitiles-base-url'."
+  (or magit-gerrit-gitiles-base-url
+      (when-let* ((remote-url (magit-gerrit-get-remote-url))
+                  (host (url-host (url-generic-parse-url remote-url))))
+        (concat "https://" host "/plugins/gitiles"))))
 
+(defun magit-gerrit--gitiles-branch ()
+  "Return the branch to browse in Gitiles.
+This is the upstream branch of the current branch when it is on the
+Gerrit remote, the default branch of the remote, or \"master\"."
+  (or (magit-gerrit--default-target-branch)
+      (when-let* ((head (magit-git-string "symbolic-ref" "--short"
+                                          (format "refs/remotes/%s/HEAD" magit-gerrit-remote))))
+        (string-remove-prefix (concat magit-gerrit-remote "/") head))
+      "master"))
+
+(defun magit-gerrit--gitiles-url (rev &optional path line)
+  "Return the Gitiles URL of REV, or of PATH at REV, at LINE."
+  (let ((base (or (magit-gerrit--gitiles-base-url) (user-error "Cannot deduce the Gitiles URL")))
+        (project (or (magit-gerrit-get-project) (user-error "No Gerrit project"))))
+    (concat (string-trim-right base "/") "/" project "/+/" rev
+            (when path
+              (concat "/" (mapconcat #'url-hexify-string (split-string path "/") "/")))
+            (when line (format "#%d" line)))))
+
+(defun magit-gerrit--get-gitiles-link (&optional permalink)
+  "Return the Gitiles URL of the thing at point.
+In a file buffer, this is the file at the current line (or the first
+line of the region).  In Magit buffers, this is the commit at point,
+the file at point or the repository.  Files and the repository are
+shown at the branch from `magit-gerrit--gitiles-branch', or at the
+HEAD commit when PERMALINK is non-nil."
+  (magit-gerrit-get-remote-url)  ; Make sure `magit-gerrit-remote' is set
+  (let ((rev (lambda () (if permalink
+                            (magit-rev-parse "HEAD")
+                          (concat "refs/heads/" (magit-gerrit--gitiles-branch))))))
+    (cond
+     ((and buffer-file-name (magit-toplevel))
+      (magit-gerrit--gitiles-url
+       (funcall rev)
+       (file-relative-name buffer-file-name (magit-toplevel))
+       (line-number-at-pos (if (use-region-p) (region-beginning) (point)))))
+     ((when-let* ((commit (and (derived-mode-p 'magit-mode) (magit-commit-at-point))))
+        (magit-gerrit--gitiles-url (magit-rev-parse commit))))
+     ((when-let* ((file (and (derived-mode-p 'magit-mode) (magit-file-at-point))))
+        (magit-gerrit--gitiles-url (funcall rev) file)))
+     (t (magit-gerrit--gitiles-url (funcall rev))))))
 
 ;;; Formatting
 
@@ -1138,12 +1172,17 @@ With a prefix argument, the query is set for all repositories."
 (define-obsolete-function-alias 'magit-gerrit-change-id-browse-url
   #'magit-gerrit-browse-commit "0.2.0")
 
-(defun magit-gerrit-gitiles-browse-url (with-line-p)
-  "Browse this file in Gitiles, highlight current line when WITH-LINE-P."
+(defun magit-gerrit-gitiles-browse (&optional permalink)
+  "Browse the thing at point in Gitiles.
+In a file buffer, browse the file at the current line.  In Magit
+buffers, browse the commit at point, the file at point or the
+repository.  With a prefix argument PERMALINK, browse files at the
+HEAD commit instead of at the branch."
   (interactive "P")
-  (browse-url (or (magit-gerrit--get-gitiles-link
-                   (when with-line-p (line-number-at-pos (point))))
-                  (user-error "Cannot build a Gitiles link for this buffer"))))
+  (browse-url (magit-gerrit--get-gitiles-link permalink)))
+
+(define-obsolete-function-alias 'magit-gerrit-gitiles-browse-url
+  #'magit-gerrit-gitiles-browse "0.2.0")
 
 (defun magit-gerrit-view-patchset-diff (&optional select-number)
   "View the diff for a patchset, optionally SELECT-NUMBER."
@@ -2061,7 +2100,8 @@ Interactively, show the change at point or read its number."
     ("H" "Install commit-msg hook"         magit-gerrit-install-commit-msg-hook)]
    ["Commit at point"
     ("o" "Show its change"                 magit-gerrit-show-commit-change)
-    ("O" "Browse its change"               magit-gerrit-browse-commit)]
+    ("O" "Browse its change"               magit-gerrit-browse-commit)
+    ("g" "Browse in Gitiles"               magit-gerrit-gitiles-browse)]
    [("y" "Copy review URL"                 magit-gerrit-copy-review-url)
     ("Y" "Copy review URL and subject"     magit-gerrit-copy-review-url-commit-message)
     ("r" "Copy review reference"           magit-gerrit-copy-ref)]])
