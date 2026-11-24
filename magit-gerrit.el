@@ -82,9 +82,8 @@
 (require 'transient)
 (require 'json)
 (require 'mule-util)
-(require 'project)
 (require 'savehist)
-(eval-when-compile (require 'cl-lib))
+(require 'cl-lib)
 
 
 ;;; Customization
@@ -289,14 +288,27 @@ All the calls are logged in `magit-gerrit-log-buffer-name'."
             (buffer-string)))
       (delete-file err-file))))
 
+(defun magit-gerrit--json-parse (string)
+  "Parse the JSON object in STRING as an alist, arrays as lists.
+JSON null and false are parsed as nil.  Use the native parser when
+available (always the case since Emacs 30), `json.el' otherwise."
+  (if (json-available-p)
+      (json-parse-string string :object-type 'alist :array-type 'list
+                         :null-object nil :false-object nil)
+    (let ((json-object-type 'alist)
+          (json-array-type 'list)
+          (json-key-type 'symbol)
+          (json-null nil)
+          (json-false nil))
+      (json-read-from-string string))))
+
 (defun magit-gerrit--parse-json-lines (output)
   "Parse OUTPUT of a Gerrit query in JSON format.
 Return the list of changes, as alists.  Signal a `user-error' when
 Gerrit reports an error."
   (let (changes)
     (dolist (line (split-string output "\n" t "[ \t\r]+"))
-      (let ((obj (json-parse-string line :object-type 'alist :array-type 'list
-                                    :null-object nil :false-object nil)))
+      (let ((obj (magit-gerrit--json-parse line)))
         (pcase (alist-get 'type obj)
           ("stats" nil)
           ("error" (user-error "Gerrit query failed: %s" (alist-get 'message obj)))
@@ -484,14 +496,16 @@ Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
 ;;; Change-Id
 
 (defun magit-gerrit-commit-change-id (&optional rev)
-  "Return Change-Id for REV or the commit at point."
+  "Return Change-Id for REV or the commit at point.
+When the commit has multiple Change-Id trailers, return the first one."
   (when-let* ((rev (or rev (magit-commit-at-point)))
-              (rev (substring rev 0 7)))
-    (if-let* ((id (gethash rev magit-gerrit--rev-change-id-cache)))
-        id
-      (when-let* ((id (magit-git-string "show" "--format=%(trailers:key=Change-Id,valueonly)" rev)))
-        (puthash rev id magit-gerrit--rev-change-id-cache)
-        id))))
+              (hash (magit-rev-parse rev)))
+    (or (gethash hash magit-gerrit--rev-change-id-cache)
+        (when-let* ((id (magit-git-string
+                         "show" "--no-patch"
+                         "--format=%(trailers:key=Change-Id,valueonly)" hash))
+                    ((not (string-empty-p id))))
+          (puthash hash id magit-gerrit--rev-change-id-cache)))))
 
 (defun magit-gerrit--get-change-id-info (id &optional invalidate-cache)
   "Return information about Change-Id ID.
@@ -511,156 +525,101 @@ When INVALIDATE-CACHE is non-nil, don't used cached values."
 
 (defun magit-gerrit--get-gitiles-link (&optional line-number)
   "Get Gitiles link, optionally with LINE-NUMBER."
-  (when-let* ((proj (magit-gerrit-get-project))
+  (when-let* ((gerrit-proj (magit-gerrit-get-project))
               (base-url (or magit-gerrit-gitiles-base-url
-                            (when-let* ((push-url (magit-gerrit-get-remote-url))
-                                        (url (url-generic-parse-url push-url)))
+                            (when-let* ((remote-url (magit-gerrit-get-remote-url))
+                                        (url (url-generic-parse-url remote-url)))
                               (concat "https://" (url-host url) "/plugins/gitiles"))))
-              (gerrit-proj (magit-gerrit-get-project))
               (branch "master")
-              (proj (project-current))
               (file-name (buffer-file-name))
-              (file-name (file-relative-name file-name (project-root proj))))
-    (concat base-url "/" gerrit-proj "/+/refs/heads/" branch "/" file-name (when line-number (format "#%d" line-number)))))
+              (toplevel (magit-toplevel))
+              (file-name (file-relative-name file-name toplevel)))
+    (concat base-url "/" gerrit-proj "/+/refs/heads/" branch "/" file-name
+            (when line-number (format "#%d" line-number)))))
 
 
 ;;; Formatting
 
-(defun magit-gerrit-string-real-length (s)
-  "Return the display length of string S."
-  (if (multibyte-string-p s)
-      (let* ((mm (- (string-bytes s) (length s)))
-             (n (- (length s) (/ mm 2))))
-        (+ mm n))
-    (length s)))
-
 (defun magit-gerrit-format-short-timestring (seconds)
-  "Format SECONDS as a short human readable duration."
-  (let* ((years  (/ seconds 32140800))
-         (months (/ seconds 2678400))
-         (days (/ seconds 86400))
-         (hours (/ seconds 3600))
-         (minutes (/ seconds 60)))
-    (cond
-     ((> years 1) (format "%2d %s" years (if (> years 2) "years" "year")))
-     ((> months 1) (format "%2d %s" months (if (> months 2) "months" "month")))
-     ((> days 1) (format "%2d %s" days (if (> days 2) "days" "day")))
-     ((> hours 1) (format "%2d %s" hours (if (> hours 2) "hours" "hour")))
-     ((> minutes 1) (format "%2d %s" minutes (if (> minutes 2) "minutes" "minute")))
-     (t "just now"))))
+  "Format SECONDS as a short human readable duration (e.g. \" 3 days\")."
+  (or (cl-loop for (unit . length) in '(("year" . 31536000) ("month" . 2592000)
+                                        ("day" . 86400) ("hour" . 3600)
+                                        ("minute" . 60))
+               for count = (floor seconds length)
+               when (>= count 1)
+               return (format "%2d %s%s" count unit (if (> count 1) "s" "")))
+      "just now"))
+
+(define-obsolete-function-alias 'magit-gerrit-string-real-length #'string-width "0.2.0")
 
 (defun magit-gerrit-create-review-labels ()
   "Create review labels heading."
-  (let* ((review-labels ""))
-    (dolist (label-tuple magit-gerrit-review-labels review-labels)
-      (setq review-labels (concat review-labels (car (cdr label-tuple)) " ")))
-    (string-trim-right review-labels)))
+  (mapconcat #'cadr magit-gerrit-review-labels " "))
+
+(defun magit-gerrit--window-width ()
+  "Return the width of the window showing the current buffer."
+  (window-width (get-buffer-window nil t)))
+
+(defun magit-gerrit--cell (string width &optional face)
+  "Pad or truncate STRING to WIDTH columns, with optional FACE.
+Widths are computed in columns, so wide characters are aligned."
+  (let ((cell (truncate-string-to-width (or string "") width nil ?\s)))
+    (if face (propertize cell 'font-lock-face face) cell)))
+
+(defun magit-gerrit--format-line (patchset subject owner branch size updated labels
+                                           &optional subject-face)
+  "Format a line of the reviews section.
+PATCHSET, SUBJECT, OWNER, BRANCH, SIZE, UPDATED and LABELS are the
+cells.  The subject takes the remaining width, the branch, size,
+update time and labels are hidden in narrow windows.  SUBJECT-FACE is
+the face of the subject."
+  (let* ((width (magit-gerrit--window-width))
+         (columns (cond ((> width 128) '(branch size updated labels))
+                        ((> width 108) '(size updated labels))
+                        ((> width 94)  '(size labels))
+                        ((> width 80)  '(labels))))
+         (head (magit-gerrit--cell patchset 13))
+         (tail (concat (magit-gerrit--cell owner 10 'magit-log-author)
+                       (when (memq 'branch columns) (magit-gerrit--cell branch 20 'magit-hash))
+                       (when (memq 'size columns) (magit-gerrit--cell size 15))
+                       (when (memq 'updated columns) (magit-gerrit--cell updated 12))
+                       (when (memq 'labels columns) labels)))
+         ;; Keep one column free to prevent the long line arrow from being shown
+         (subject-width (max 10 (- width (string-width head) (string-width tail) 1))))
+    (concat head (magit-gerrit--cell subject subject-width subject-face) tail "\n")))
 
 (defun magit-gerrit-pretty-print-review-header ()
   "Return the header line of the reviews section."
-  (let* ((wid (window-width))
-         ;; number
-         (numstr (format "%-13s" "Patchset"))
-         ;; branch info
-         (branch (truncate-string-to-width "Branch" 20 nil ?\s))
-         ;; sizeinfo
-         (sizeinfo (truncate-string-to-width (format "     %s" "Delta") 15 nil ?\s))
-         ;; owner
-         (author (truncate-string-to-width (format "%s" "Owner") 10 nil ?\s))
-         ;; lastupdate
-         (lastupdate (truncate-string-to-width (format "%s" "Updated") 12 nil ?\s))
-         ;; approvals
-         (approvals-info (magit-gerrit-create-review-labels))
-         ;; subject
-         (subjstr (truncate-string-to-width
-                   (format "%s" "Subject")
-                   (- wid (length (concat numstr author
-                                          (cond
-                                           ((> wid 128) (concat branch sizeinfo lastupdate approvals-info))
-                                           ((> wid 108) (concat sizeinfo lastupdate approvals-info))
-                                           ((> wid 94)  (concat sizeinfo approvals-info))
-                                           ((> wid 80)  (concat approvals-info))
-                                           (t ""))))
-                      1)
-                   nil ?\s))
-         (show-str (concat numstr subjstr author
-                           (cond
-                            ((> wid 128) (concat branch sizeinfo lastupdate approvals-info))
-                            ((> wid 108) (concat sizeinfo lastupdate approvals-info))
-                            ((> wid 94)  (concat sizeinfo approvals-info))
-                            ((> wid 80)  (concat approvals-info))
-                            (t "")))))
-    (propertize (format "%s\n" show-str) 'font-lock-face 'highlight)))
+  (propertize (magit-gerrit--format-line "Patchset" "Subject" "Owner" "Branch"
+                                         "     Delta" "Updated"
+                                         (magit-gerrit-create-review-labels))
+              'font-lock-face 'highlight))
 
-(defun magit-gerrit-pretty-print-review (num patchsetn subj owner-name br size-i size-d ctime approvals-info &optional draft)
-  "Return the line of a review.
-NUM is the change number, PATCHSETN the patchset number, SUBJ the
-subject, OWNER-NAME the owner, BR the branch, SIZE-I and SIZE-D the
-inserted and deleted lines, CTIME the last update time and
-APPROVALS-INFO the formatted approvals.  When DRAFT is non-nil, the
-subject is dimmed."
-  (let* ((wid (window-width)) ; to prevents long line arrow from being shown
-         ;; number
-         (numstr (propertize (format "%-8s" num) 'font-lock-face 'magit-hash))
-         ;; patchset num
-         (patchsetstr (propertize (format "%-5s" (format "[%s]" patchsetn))
-                                  'font-lock-face 'magit-hash))
-         ;; branch info
-         (branch (propertize (truncate-string-to-width br 20 nil ?\s)
-                             'font-lock-face 'magit-hash))
-         ;; sizeinfo
-         (sizeinfo (concat (propertize (truncate-string-to-width
-                                        (format "%+7s"  (concat "+" (number-to-string size-i)))
-                                        7 nil ?\s)
-                                       'font-lock-face 'diff-added)
-                           " "
-                           (propertize (truncate-string-to-width (format "-%s" size-d) 7 nil ?\s)
-                                       'font-lock-face 'diff-removed)))
-         ;; owner
-         (author (propertize (truncate-string-to-width (format "%s" owner-name) 10 nil ?\s)
-                             'font-lock-face 'magit-log-author))
-         ;; lastupdate
-         (lastupdate (truncate-string-to-width
-                      (magit-gerrit-format-short-timestring
-                       (time-to-seconds (time-since ctime)))
-                      12 nil ?\s))
-         ;; subject
-         (subjstr (propertize
-                   (truncate-string-to-width
-                    subj
-                    (- wid (length (concat numstr patchsetstr
-                                           (cond
-                                            ((> wid 128) (concat branch sizeinfo lastupdate approvals-info))
-                                            ((> wid 108) (concat sizeinfo lastupdate approvals-info))
-                                            ((> wid 94)  (concat sizeinfo approvals-info))
-                                            ((> wid 80)  (concat approvals-info))
-                                            (t ""))))
-                       (magit-gerrit-string-real-length author)
-                       1)
-                    nil ?\s)
-                   'font-lock-face
-                   (if draft 'magit-dimmed 'magit-filename)))
-         (show-str (concat numstr patchsetstr subjstr author
-                           (cond
-                            ((> wid 128) (concat branch sizeinfo lastupdate approvals-info))
-                            ((> wid 108) (concat sizeinfo lastupdate approvals-info))
-                            ((> wid 94)  (concat sizeinfo approvals-info))
-                            ((> wid 80)  (concat approvals-info))
-                            (t "")))))
-    (format "%s\n" show-str)))
-
-(defun magit-gerrit-match-review-labels (score type)
-  "Match SCORE to correct TYPE."
-  (let ((matchlist nil))
-    (dolist (labeltuple magit-gerrit-review-labels matchlist)
-      (push (and (string= type (car labeltuple)) score) matchlist))
-    (nreverse matchlist)))
+(defun magit-gerrit--format-review (change)
+  "Return the line of the reviews section for CHANGE."
+  (magit-gerrit--format-line
+   (concat (propertize (format "%-8s" (magit-gerrit-change-number change))
+                       'font-lock-face 'magit-hash)
+           (propertize (format "[%s]" (magit-gerrit-change-patchset-number change))
+                       'font-lock-face 'magit-hash))
+   (magit-gerrit-change-subject change)
+   (magit-gerrit-change-owner-name change)
+   (magit-gerrit-change-branch change)
+   (concat (propertize (format "%7s" (format "+%d" (magit-gerrit-change-insertions change)))
+                       'font-lock-face 'diff-added)
+           " "
+           (propertize (format "-%d" (magit-gerrit-change-deletions change))
+                       'font-lock-face 'diff-removed))
+   (when-let* ((time (magit-gerrit-change-last-updated change)))
+     (magit-gerrit-format-short-timestring (time-to-seconds (time-since time))))
+   (magit-gerrit-wash-approvals-oneline (magit-gerrit-change-approvals change))
+   (if (magit-gerrit-change-wip-p change) 'magit-dimmed 'magit-filename)))
 
 (defun magit-gerrit-trans-score (type value-list)
   "Format the votes VALUE-LIST of label TYPE as a single character."
   (if (and value-list (length> value-list 0))
-      (let ((min-v (apply 'min value-list))
-            (max-v (apply 'max value-list))
+      (let ((min-v (apply #'min value-list))
+            (max-v (apply #'max value-list))
             (t-max-v 1)
             (t-min-v -1))
         (if (string= "Code-Review" type)
@@ -676,14 +635,14 @@ subject is dimmed."
   "Format APPROVALS on one line, one column per review label."
   (let* (type-values)
     (seq-doseq (approval approvals)
-      (let ((type (cdr (assq 'type approval)))
-            (value (string-to-number (cdr (assq 'value approval)))))
+      (let ((type (alist-get 'type approval))
+            (value (string-to-number (alist-get 'value approval))))
         (push value (alist-get type type-values nil nil #'string-equal))))
     (mapconcat
      (lambda (elem)
        (let* ((long (car elem))
               (score (magit-gerrit-trans-score
-                      long (cdr (assoc long type-values)))))
+                      long (alist-get long type-values nil nil #'string-equal))))
          (format "%2s" score)))
      magit-gerrit-review-labels
      " ")))
@@ -697,18 +656,7 @@ subject is dimmed."
              (magit-gerrit-change-subject change)
              (magit-gerrit-change-owner-name change))
     (magit-insert-section (gerrit-change change)
-      (insert (magit-gerrit-pretty-print-review
-               (magit-gerrit-change-number change)
-               (magit-gerrit-change-patchset-number change)
-               (magit-gerrit-change-subject change)
-               (magit-gerrit-change-owner-name change)
-               (magit-gerrit-change-branch change)
-               (magit-gerrit-change-insertions change)
-               (magit-gerrit-change-deletions change)
-               (magit-gerrit-change-last-updated change)
-               (magit-gerrit-wash-approvals-oneline
-                (magit-gerrit-change-approvals change))
-               (magit-gerrit-change-wip-p change))))))
+      (insert (magit-gerrit--format-review change)))))
 
 (defvar-keymap magit-gerrit-change-section-map
   :doc "Keymap for the sections of Gerrit changes."
@@ -731,21 +679,14 @@ Errors are displayed in the section instead of aborting the refresh."
 
 ;;; Patchsets
 
-(defsubst magit-gerrit-process-wait ()
-  "Wait for the current Magit process to finish."
-  (while (and magit-this-process (eq (process-status magit-this-process) 'run))
-    (sleep-for 0.005)))
-
 (defun magit-gerrit-create-branch-force (branch parent)
   "Switch HEAD to new BRANCH at revision PARENT and update working tree.
 Fails if working tree or staging area contain uncommitted changes.
 Succeed even if branch already exist
 \(\"git checkout -B BRANCH REVISION\")."
-  (cond ((run-hook-with-args-until-success
-          'magit-create-branch-hook branch parent))
-        ((and branch (not (string= branch "")))
-         (magit-save-repository-buffers)
-         (magit-run-git "checkout" "-B" branch parent))))
+  (when (and branch (not (string-empty-p branch)))
+    (magit-save-repository-buffers)
+    (magit-run-git "checkout" "-B" branch parent)))
 
 (defun magit-gerrit-get-ref (&optional select-number)
   "Return the ref of the review at point.
@@ -761,11 +702,17 @@ When SELECT-NUMBER is non-nil, ask for the patchset number."
       ref)))
 
 (defun magit-gerrit-fetch-patchset (&optional ref select-number)
-  "Fetch a Gerrit review patchset at REF, optionally SELECT-NUMBER."
-  (when-let* ((ref (or ref (magit-gerrit-get-ref select-number))))
-    (magit-git-fetch magit-gerrit-remote ref)
-    (message (format "Waiting a git fetch from %s to complete..." magit-gerrit-remote))
-    (magit-gerrit-process-wait)))
+  "Fetch a Gerrit review patchset at REF, optionally SELECT-NUMBER.
+The patchset is available as FETCH_HEAD afterwards.  Return REF."
+  (let ((ref (or ref (magit-gerrit-get-ref select-number)
+                 (user-error "No Gerrit change at point"))))
+    (magit-gerrit-get-remote-url)  ; Make sure `magit-gerrit-remote' is set
+    (message "Fetching %s from %s..." ref magit-gerrit-remote)
+    (unless (zerop (magit-call-git "fetch" magit-gerrit-remote ref))
+      (user-error "Failed to fetch %s from %s, see %s"
+                  ref magit-gerrit-remote
+                  (substitute-command-keys "\\[magit-process-buffer]")))
+    ref))
 
 
 ;;; Commands
@@ -793,8 +740,9 @@ Edit globally when called with universal argument ARG."
 (defun magit-gerrit-gitiles-browse-url (with-line-p)
   "Browse this file in Gitiles, highlight current line when WITH-LINE-P."
   (interactive "P")
-  (when-let* ((url (magit-gerrit--get-gitiles-link (when with-line-p (line-number-at-pos (point))))))
-    (browse-url url)))
+  (browse-url (or (magit-gerrit--get-gitiles-link
+                   (when with-line-p (line-number-at-pos (point))))
+                  (user-error "Cannot build a Gitiles link for this buffer"))))
 
 (defun magit-gerrit-view-patchset-diff (&optional select-number)
   "View the diff for a patchset, optionally SELECT-NUMBER."
@@ -802,7 +750,7 @@ Edit globally when called with universal argument ARG."
   (when-let* ((ref (magit-gerrit-get-ref select-number)))
     (let ((dir default-directory))
       (magit-gerrit-fetch-patchset ref)
-      (message (format "Generating Gerrit Patchset for refs %s dir %s" ref dir))
+      (message "Generating Gerrit Patchset for refs %s dir %s" ref dir)
       (magit-diff-range "FETCH_HEAD~1..FETCH_HEAD"))))
 
 (defun magit-gerrit-download-patchset (&optional select-number)
@@ -818,7 +766,7 @@ Edit globally when called with universal argument ARG."
                            (if topic (concat topic "-") "")
                            num)))
       (magit-gerrit-fetch-patchset ref)
-      (message (format "Checking out refs %s to %s in %s" ref branch dir))
+      (message "Checking out refs %s to %s in %s" ref branch dir)
       (magit-gerrit-create-branch-force branch "FETCH_HEAD"))))
 
 (defun magit-gerrit-cherry-pick-patchset (&optional select-number)
@@ -834,18 +782,20 @@ Edit globally when called with universal argument ARG."
       (browse-url (magit-gerrit-change-url change))
     (call-interactively #'magit-visit-thing)))
 
+(defun magit-gerrit--copy (string)
+  "Copy STRING to the kill ring (and the clipboard) and show it."
+  (kill-new string)
+  (message "Copied: %s" string))
+
 (defun magit-gerrit-copy-review (with-commit-message)
   "Copy review url and commit message when WITH-COMMIT-MESSAGE is non-nil."
-  (when-let* ((change (magit-gerrit-change-at-point)))
-    (with-temp-buffer
-      (insert
-       (concat (when with-commit-message
-                 (concat (format "%s: " (magit-gerrit-change-number change))
-                         (car (split-string (magit-gerrit-change-commit-message change) "\n" t))
-                         " | "))
-               (magit-gerrit-change-url change)))
-      (message "%s" (buffer-string))
-      (clipboard-kill-region (point-min) (point-max)))))
+  (let ((change (magit-gerrit--change-at-point-or-error)))
+    (magit-gerrit--copy
+     (concat (when with-commit-message
+               (format "%s: %s | "
+                       (magit-gerrit-change-number change)
+                       (car (split-string (magit-gerrit-change-commit-message change) "\n" t))))
+             (magit-gerrit-change-url change)))))
 
 (defun magit-gerrit-copy-review-url ()
   "Copy review's url only."
@@ -860,12 +810,8 @@ Edit globally when called with universal argument ARG."
 (defun magit-gerrit-copy-ref (&optional select-number)
   "Copy review's reference hash, ask for patchset when SELECT-NUMBER."
   (interactive "P")
-  (if-let* ((ref (magit-gerrit-get-ref select-number)))
-      (with-temp-buffer
-        (insert ref)
-        (clipboard-kill-region (point-min) (point-max))
-        (message "Copied %S to clipboard." ref))
-    (user-error "No Gerrit revision at point")))
+  (magit-gerrit--copy (or (magit-gerrit-get-ref select-number)
+                          (user-error "No Gerrit change at point"))))
 
 (defun magit-gerrit-add-reviewer ()
   "Add a reviewer to the review at point."
