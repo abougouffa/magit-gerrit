@@ -100,6 +100,11 @@ Otherwise, the fetch URL is used (see \"git remote get-url\")."
   :group 'magit-gerrit
   :type 'boolean)
 
+(defcustom magit-gerrit-ssh-program "ssh"
+  "The SSH program used to run Gerrit commands."
+  :group 'magit-gerrit
+  :type 'string)
+
 (defcustom magit-gerrit-gitiles-base-url nil
   "The base URL for Gitiles.
 When nil, it is deduced from the remote URL as
@@ -131,9 +136,10 @@ label name as displayed in the Gerrit UI and ABBREVIATION is a
   :type 'boolean)
 
 (defcustom magit-gerrit-extra-options nil
-  "Extra query terms added when fetching reviews (e.g. \"is:watched\")."
+  "Extra query terms added when fetching reviews (e.g. \"is:watched\").
+This can be a list of terms, or a string of space-separated terms."
   :group 'magit-gerrit
-  :type '(repeat string))
+  :type '(choice (repeat string) string))
 
 (defcustom magit-gerrit-collapse-patchset-section nil
   "Collapse/hide gerrit section containing patchsets by default.
@@ -195,6 +201,9 @@ See https://gerrit-review.googlesource.com/Documentation/user-search.html")
 (defvar magit-gerrit--dispatch-is-added nil
   "Non-nil when the Gerrit entry has been added to `magit-dispatch'.")
 
+(defconst magit-gerrit-log-buffer-name "*magit-gerrit-log*"
+  "Name of the buffer logging the Gerrit SSH commands.")
+
 (defconst magit-gerrit-push-options
   '((wip) (ready) (private) (remove-private) (publish-comments)
     (hashtag . t) (topic . t) (message . t) (notify . (NONE OWNER OWNER_REVIEWERS ALL)))
@@ -205,46 +214,112 @@ possible values.")
 
 ;;; Gerrit SSH commands
 
+(defun magit-gerrit--quote (arg)
+  "Quote ARG for the command line parser of Gerrit's SSH daemon.
+Gerrit splits the command line itself (there is no remote shell), it
+supports POSIX-like single quotes, double quotes and backslashes."
+  (if (string-match-p "\\`[-[:alnum:]_.,:/=@+%^~]+\\'" arg)
+      arg
+    (concat "'" (string-replace "'" "'\\''" arg) "'")))
+
 (defun magit-gerrit--command (cmd &rest args)
-  "Build SSH parameters to run Gerrit's CMD with ARGS."
+  "Build SSH parameters to run Gerrit's CMD with ARGS.
+ARGS are flattened, nil elements are removed and the remaining ones
+are quoted for Gerrit."
   `("-x" "-p"
     ,(number-to-string magit-gerrit-port)
     ,(or magit-gerrit-ssh-creds
-         (error "`magit-gerrit-ssh-creds' must be set!"))
+         (user-error "`magit-gerrit-ssh-creds' must be set!"))
     "gerrit"
     ,cmd
-    ,@(seq-filter #'identity (flatten-list args))))
+    ,@(mapcar (lambda (arg) (magit-gerrit--quote (format "%s" arg)))
+              (delq nil (flatten-list args)))))
 
-(defun magit-gerrit--ssh-cmd (cmd &rest args)
-  "Call Gerrit's command CMD with ARGS via SSH."
-  (apply #'call-process
-         "ssh" nil nil nil
-         (apply #'magit-gerrit--command cmd args)))
+(defun magit-gerrit--log (ssh-args exit-code stderr)
+  "Log the SSH call with SSH-ARGS, its EXIT-CODE and STDERR."
+  (with-current-buffer (get-buffer-create magit-gerrit-log-buffer-name)
+    (let ((inhibit-read-only t))
+      (goto-char (point-max))
+      (insert (format "[%s] %s %s => %s\n"
+                      (format-time-string "%F %T")
+                      magit-gerrit-ssh-program
+                      (string-join ssh-args " ")
+                      exit-code))
+      (unless (string-empty-p stderr)
+        (insert stderr "\n")))))
 
-(defun magit-gerrit--query (&optional prj)
-  "Query project PRJ using `magit-gerrit-query-filters' or `status:open'."
+(defun magit-gerrit--ssh-call (cmd &rest args)
+  "Call Gerrit's command CMD with ARGS via SSH and return its output.
+ARGS are processed as in `magit-gerrit--command'.  Signal a
+`user-error' containing the error output when the command fails.
+All the calls are logged in `magit-gerrit-log-buffer-name'."
+  (let ((ssh-args (apply #'magit-gerrit--command cmd args))
+        (err-file (make-temp-file "magit-gerrit-"))
+        ;; SSH is always run locally, even for remote repositories
+        (default-directory (if (file-remote-p default-directory)
+                               temporary-file-directory
+                             default-directory)))
+    (unwind-protect
+        (with-temp-buffer
+          (let* ((exit-code (apply #'call-process magit-gerrit-ssh-program
+                                   nil (list t err-file) nil ssh-args))
+                 (stderr (with-temp-buffer
+                           (insert-file-contents err-file)
+                           (string-trim (buffer-string)))))
+            (magit-gerrit--log ssh-args exit-code stderr)
+            (unless (eq exit-code 0)
+              (user-error "Gerrit command \"%s\" failed: %s" cmd
+                          (if (string-empty-p stderr)
+                              (format "exit code %s" exit-code)
+                            (car (split-string stderr "\n" t)))))
+            (buffer-string)))
+      (delete-file err-file))))
+
+(defun magit-gerrit--parse-json-lines (output)
+  "Parse OUTPUT of a Gerrit query in JSON format.
+Return the list of changes, as alists.  Signal a `user-error' when
+Gerrit reports an error."
+  (let (changes)
+    (dolist (line (split-string output "\n" t "[ \t\r]+"))
+      (let ((obj (json-parse-string line :object-type 'alist :array-type 'list
+                                    :null-object nil :false-object nil)))
+        (pcase (alist-get 'type obj)
+          ("stats" nil)
+          ("error" (user-error "Gerrit query failed: %s" (alist-get 'message obj)))
+          (_ (push obj changes)))))
+    (nreverse changes)))
+
+(defun magit-gerrit--query-changes (query &rest options)
+  "Run the Gerrit QUERY with OPTIONS, return the matching change list.
+QUERY is a string or a list of query terms, OPTIONS are additional
+options for \"gerrit query\" such as \"--current-patch-set\"."
+  (magit-gerrit--parse-json-lines
+   (magit-gerrit--ssh-call "query" "--format=JSON" options query)))
+
+(defun magit-gerrit--query-terms (&optional prj)
+  "Return the query terms to list the reviews of project PRJ.
+Uses `magit-gerrit-query-filters' or \"status:open\"."
   (when-let* ((prj (or prj (magit-gerrit-get-project))))
-    (magit-gerrit--command
-     "query"
-     "--format=JSON"
-     "--current-patch-set"
-     (concat "project:" prj)
-     magit-gerrit-extra-options
-     (if magit-gerrit-query-filters
-         (shell-quote-argument magit-gerrit-query-filters)
-       "status:open"))))
+    (append
+     (list (concat "project:" prj))
+     (if (stringp magit-gerrit-extra-options)
+         (split-string magit-gerrit-extra-options)
+       magit-gerrit-extra-options)
+     (list (or magit-gerrit-query-filters "status:open")))))
 
-(defun magit-gerrit--review-submit (prj rev &optional msg)
-  "Submit change REV for merging on PRJ with optional message MSG."
-  (magit-gerrit--ssh-cmd "review" "--project" prj "--submit" (or msg "") rev))
+(defun magit-gerrit--fetch-reviews ()
+  "Fetch the reviews of the current project."
+  (when-let* ((terms (magit-gerrit--query-terms)))
+    (magit-gerrit--query-changes terms "--current-patch-set")))
 
-(defun magit-gerrit--code-review (prj rev score &optional msg)
-  "Set code-review SCORE for REV on PRJ, with optional MSG."
-  (magit-gerrit--ssh-cmd "review" "--project" prj "--code-review" score (or msg "") rev))
+(defun magit-gerrit--message-args (args)
+  "Return the \"--message\" arguments from the transient ARGS."
+  (when-let* ((msg (transient-arg-value "--message=" args)))
+    (list "--message" msg)))
 
-(defun magit-gerrit--review-verify (prj rev score &optional msg)
-  "Set verified SCORE for REV on PRJ, with optional MSG."
-  (magit-gerrit--ssh-cmd "review" "--project" prj "--verified" score (or msg "") rev))
+(defun magit-gerrit--review (prj rev &rest args)
+  "Run \"gerrit review\" for revision REV of project PRJ with ARGS."
+  (magit-gerrit--ssh-call "review" "--project" prj args rev))
 
 
 ;;; Remote and project
@@ -300,16 +375,12 @@ Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
 When INVALIDATE-CACHE is non-nil, don't used cached values."
   (if-let* ((cached (and (not invalidate-cache) (gethash id magit-gerrit--change-id-cache))))
       cached
-    (let* ((magit-gerrit-query-filters (concat "change:" id))
-           (out (shell-command-to-string (string-join (cons "ssh" (magit-gerrit--query)) " ")))
-           vals)
-      (with-temp-buffer
-        (insert out)
-        (goto-char (point-min))
-        (while-let ((jobj (ignore-errors (json-read))))
-          (push jobj vals))
-        (puthash id vals magit-gerrit--change-id-cache))
-      vals)))
+    (puthash id
+             (magit-gerrit--query-changes
+              (list (concat "project:" (magit-gerrit-get-project))
+                    (concat "change:" id))
+              "--current-patch-set")
+             magit-gerrit--change-id-cache)))
 
 
 ;;; Gitiles
@@ -496,12 +567,9 @@ subject is dimmed."
 
 ;;; Status section
 
-(defun magit-gerrit-wash-review ()
-  "Wash one review from the JSON output of a Gerrit query."
-  (let* ((beg (point))
-         (jobj (json-read))
-         (end (point))
-         (num (cdr-safe (assoc 'number jobj)))
+(defun magit-gerrit--insert-review (jobj)
+  "Insert the review JOBJ (a change returned by a Gerrit query)."
+  (let* ((num (cdr-safe (assoc 'number jobj)))
          (subj (cdr-safe (assoc 'subject jobj)))
          (br (cdr-safe (assoc 'branch jobj)))
          (owner (cdr-safe (assoc 'owner jobj)))
@@ -511,42 +579,30 @@ subject is dimmed."
          (last-update (cdr-safe (assoc 'lastUpdated jobj)))
          (size-insert (cdr-safe (assoc 'sizeInsertions patchsets)))
          (size-delete (cdr-safe (assoc 'sizeDeletions patchsets)))
-         ;; compare w/t since when false the value is => :json-false
          (isdraft (eq (cdr-safe (assoc 'isDraft patchsets)) t))
-         (approvs (cdr-safe (if (listp patchsets)
-                                (assoc 'approvals patchsets)
-                              (assoc 'approvals (aref patchsets 0)))))
+         (approvs (cdr-safe (assoc 'approvals patchsets)))
          (scoreinfo (magit-gerrit-wash-approvals-oneline approvs)))
-    (when (and beg end)
-      (delete-region beg end))
     (when (and num subj owner-name)
       (magit-insert-section (section subj)
         (insert (propertize
                  (magit-gerrit-pretty-print-review
                   num patchset-num subj owner-name br size-insert
                   size-delete last-update scoreinfo isdraft)
-                 'magit-gerrit-jobj jobj))
-        (add-text-properties beg (point) `(magit-gerrit-jobj ,jobj)))
-      t)))
-
-(defun magit-gerrit-wash-reviews (&rest _args)
-  "Wash the JSON output of a Gerrit query."
-  (magit-wash-sequence #'magit-gerrit-wash-review))
-
-(defun magit-gerrit-section (_section title washer &rest args)
-  "Insert a section titled TITLE, filled by WASHER using ssh ARGS."
-  (let ((magit-git-executable "ssh")
-        (magit-remote-git-executable "ssh")
-        (magit-git-global-arguments nil))
-    (magit-insert-section (section title magit-gerrit-collapse-patchset-section)
-      (magit-insert-heading title)
-      (insert (magit-gerrit-pretty-print-review-header))
-      (magit-git-wash washer (split-string (car args)))
-      (insert "\n"))))
+                 'magit-gerrit-jobj jobj))))))
 
 (defun magit-gerrit-insert-reviews-section ()
-  "Insert the Gerrit reviews section in the status buffer."
-  (magit-gerrit-section 'gerrit-reviews "Reviews:" 'magit-gerrit-wash-reviews (string-join (magit-gerrit--query) " ")))
+  "Insert the Gerrit reviews section in the status buffer.
+Errors are displayed in the section instead of aborting the refresh."
+  (when (magit-gerrit-get-project)
+    (magit-insert-section (gerrit-reviews nil magit-gerrit-collapse-patchset-section)
+      (magit-insert-heading "Reviews:")
+      (insert (magit-gerrit-pretty-print-review-header))
+      (condition-case err
+          (mapc #'magit-gerrit--insert-review (magit-gerrit--fetch-reviews))
+        (error
+         (insert (propertize (format "%s\n" (error-message-string err))
+                             'font-lock-face 'error))))
+      (insert "\n"))))
 
 
 ;;; Patchsets
@@ -697,7 +753,7 @@ Edit globally when called with universal argument ARG."
 (defun magit-gerrit-add-reviewer ()
   "Add a reviewer to the review at point."
   (interactive)
-  (magit-gerrit--ssh-cmd
+  (magit-gerrit--ssh-call
    "set-reviewers"
    "--project" (magit-gerrit-get-project)
    "--add" (read-string "Reviewer Name/Email: ")
@@ -705,63 +761,54 @@ Edit globally when called with universal argument ARG."
 
 (defun magit-gerrit-arguments ()
   "Return the arguments of the `magit-gerrit-dispatch' transient."
-  (or (transient-args 'magit-gerrit-dispatch)
-      (list "")))
+  (transient-args 'magit-gerrit-dispatch))
+
+(defun magit-gerrit--current-revision ()
+  "Return the current patchset revision of the review at point."
+  (or (cdr-safe (assoc 'revision
+                       (cdr-safe (assoc 'currentPatchSet
+                                        (magit-gerrit-review-at-point)))))
+      (user-error "No Gerrit review at point")))
 
 (defun magit-gerrit-verify-review (args)
   "Verify a Gerrit review, using transient ARGS."
-  (interactive (magit-gerrit-arguments))
-  (let ((score (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1"))
-        (rev (cdr-safe (assoc
-                        'revision
-                        (cdr-safe (assoc 'currentPatchSet
-                                         (magit-gerrit-review-at-point))))))
-        (prj (magit-gerrit-get-project)))
-    (magit-gerrit--review-verify prj rev score args)
+  (interactive (list (magit-gerrit-arguments)))
+  (let ((rev (magit-gerrit--current-revision))
+        (score (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1")))
+    (magit-gerrit--review (magit-gerrit-get-project) rev
+                          "--verified" score (magit-gerrit--message-args args))
     (magit-refresh)))
 
 (defun magit-gerrit-code-review (args)
   "Perform a Gerrit code review, using transient ARGS."
-  (interactive (magit-gerrit-arguments))
-  (let ((score (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1"))
-        (rev (cdr-safe (assoc
-                        'revision
-                        (cdr-safe (assoc 'currentPatchSet
-                                         (magit-gerrit-review-at-point))))))
-        (prj (magit-gerrit-get-project)))
-    (magit-gerrit--code-review prj rev score args)
+  (interactive (list (magit-gerrit-arguments)))
+  (let ((rev (magit-gerrit--current-revision))
+        (score (completing-read "Score: " '("-2" "-1" "0" "+1" "+2") nil t "+1")))
+    (magit-gerrit--review (magit-gerrit-get-project) rev
+                          "--code-review" score (magit-gerrit--message-args args))
     (magit-refresh)))
 
 (defun magit-gerrit-submit-review (args)
   "Submit a Gerrit code review, using transient ARGS."
-  (interactive (magit-gerrit-arguments))
-  (let ((prj (magit-gerrit-get-project))
-        (rev (cdr-safe (assoc 'revision (cdr-safe (assoc 'currentPatchSet (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--review-submit prj rev args)
-    (magit-fetch-all-no-prune)
-    (magit-refresh)))
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--review (magit-gerrit-get-project) (magit-gerrit--current-revision)
+                        "--submit" (magit-gerrit--message-args args))
+  (magit-fetch-all-no-prune)
+  (magit-refresh))
 
-(defun magit-gerrit-abandon-review ()
-  "Abandon the review at point."
-  (interactive)
-  (let ((prj (magit-gerrit-get-project))
-        (rev (cdr-safe (assoc
-                        'revision
-                        (cdr-safe (assoc 'currentPatchSet
-                                         (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--ssh-cmd "review" "--project" prj "--abandon" rev)
-    (magit-refresh)))
+(defun magit-gerrit-abandon-review (args)
+  "Abandon the review at point, using transient ARGS."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--review (magit-gerrit-get-project) (magit-gerrit--current-revision)
+                        "--abandon" (magit-gerrit--message-args args))
+  (magit-refresh))
 
-(defun magit-gerrit-restore-review ()
-  "Restore the abandoned review at point."
-  (interactive)
-  (let ((prj (magit-gerrit-get-project))
-        (rev (cdr-safe (assoc
-                        'revision
-                        (cdr-safe (assoc 'currentPatchSet
-                                         (magit-gerrit-review-at-point)))))))
-    (magit-gerrit--ssh-cmd "review" "--project" prj "--restore" rev)
-    (magit-refresh)))
+(defun magit-gerrit-restore-review (args)
+  "Restore the abandoned review at point, using transient ARGS."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--review (magit-gerrit-get-project) (magit-gerrit--current-revision)
+                        "--restore" (magit-gerrit--message-args args))
+  (magit-refresh))
 
 
 ;;; Push
@@ -818,22 +865,11 @@ When WITH-OPT is non-nil, ask for a push option."
 
 ;;; Transient
 
-(defun magit-gerrit-read-message (&rest _args)
-  "Read a review message."
-  (format "\'%s\'" (read-from-minibuffer "Message: ")))
-
-(transient-define-argument magit-gerrit--transient-arg-message ()
-  :description "Message"
-  :class 'transient-option
-  :key "-m"
-  :argument "--message "
-  :reader 'magit-gerrit-read-message)
-
 ;;;###autoload (autoload 'magit-gerrit-dispatch "magit-gerrit" nil t)
 (transient-define-prefix magit-gerrit-dispatch ()
   "Transient menu for `magit-gerrit' commands."
   ["Arguments"
-   ("-m"                                   magit-gerrit--transient-arg-message)]
+   ("-m" "Message"                         "--message=")]
   [["Actions"
     ("A" "Add reviewer"                    magit-gerrit-add-reviewer)
     ("B" "Abandon review"                  magit-gerrit-abandon-review)
