@@ -5,9 +5,9 @@
 
 ;; Author: Brian Fransioli <assem@terranpro.org>
 ;; Author: Abdelhak Bougouffa
-;; URL: https://github.com/terranpro/magit-gerrit
+;; URL: https://github.com/abougouffa/magit-gerrit
 ;; Package-Requires: ((emacs "29.1") (magit "4.0.0") (transient "0.5.0"))
-;; Package-Version: 0.1.0
+;; Package-Version: 0.2.0
 
 ;; This program is free software; you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License as
@@ -25,56 +25,43 @@
 
 ;;; Commentary:
 
-;; Magit plugin to make Gerrit code review easy-to-use from Emacs and
-;; without the need for a browser!
+;; Magit plugin for Gerrit Code Review: review, vote, push and manage
+;; changes from Emacs, through Gerrit's SSH interface.
 ;;
-;; Currently uses the [deprecated] gerrit ssh interface, which has
-;; meant that obtaining the list of reviewers is not possible, only
-;; the list of approvals (those who have already verified and/or code
-;; reviewed).
-
-
-;;; To Use:
-
-;; (require 'magit-gerrit)
-;; (setq-default magit-gerrit-ssh-creds "myid@gerrithost.org")
-
-;; M-x `magit-status'
-;; _ <= magit-gerrit uses the _ prefix (see `magit-gerrit-popup-prefix')
-
-
-;;; Workflow:
-
-;; 1) *check out branch => changes => (ma)git commit*
-;; 2) _ P  <= [*P*ush for review]
-;; 3) _ A  <= [*A*dd reviewer] (by email address)
-;; 4) *wait for verification/code reviews* [approvals shown in status]
-;; 5) _ S  <= [*S*ubmit review]
-
-
-;;; Other Comments:
-
-;; `magit-gerrit-ssh-creds' is buffer local, so if you work with
-;; multiple Gerrit's, you can make this a file or directory local
-;; variable for one particular project.
-
-;; If your git remote for gerrit is not the default "origin", then
-;; `magit-gerrit-remote' should be adjusted accordingly (e.g. "gerrit")
-
-;; Recommended to auto add reviewers via git hooks (precommit), rather
-;; than manually performing '_ A' for every review.
-
-;; `magit-gerrit' will be enabled automatically on `magit-status' if
-;; the git remote repo uses the same creds found in
-;; `magit-gerrit-ssh-creds'.
-
-;; Ex:  magit-gerrit-ssh-creds == br.fransioli@gerrit.org
-;; $ cd ~/elisp; git remote -v => https://github.com/terranpro/magit-gerrit.git
-;; ^~~ `magit-gerrit-mode' would *NOT* be enabled here
-
-;; $ cd ~/gerrit/prja; git remote -v => ssh://br.fransioli@gerrit.org/.../prja
-;; ^~~ `magit-gerrit-mode' *WOULD* be enabled here
-
+;; - A "Reviews" section in `magit-status', with query presets.
+;; - A buffer showing the details of a change: labels, submit
+;;   requirements, reviewers, dependencies, files, patchsets, messages
+;;   and inline comments (`magit-gerrit-show-change').
+;; - Votes on any label, submit, abandon, restore, rebase, move, and
+;;   management of reviewers, CCs, topics and the WIP state.
+;; - A push menu with Gerrit's push options (`magit-gerrit-push').
+;; - Viewing, checking out and cherry-picking patchsets.
+;; - The change of commits in revision and log buffers.
+;; - Installation of the commit-msg hook and browsing in Gitiles.
+;;
+;; Setup:
+;;
+;;   (with-eval-after-load 'magit
+;;     (require 'magit-gerrit)
+;;     (magit-gerrit-auto-enable))
+;;
+;; This enables `magit-gerrit-mode' in the Magit buffers of
+;; repositories whose remote ("origin" or "gerrit", see
+;; `magit-gerrit-remote') is an SSH URL on Gerrit's port, such as
+;; ssh://john@review.example.com:29418/project.  Otherwise, set
+;; `magit-gerrit-ssh-creds' (and `magit-gerrit-force-enable') in a
+;; .dir-locals.el file.
+;;
+;; Press "_" (`magit-gerrit-popup-prefix') in a Magit buffer to open the
+;; Gerrit menu.  A typical workflow:
+;;
+;; 1) commit ("_ H" installs the hook adding Change-Ids to commits),
+;; 2) "_ P p" pushes the commit at point for review,
+;; 3) "_ A" adds reviewers,
+;; 4) RET on a change in the Reviews section shows its comments,
+;; 5) "_ v" votes and "_ S" submits.
+;;
+;; See the README for the full documentation.
 
 ;;; Code:
 
