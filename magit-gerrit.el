@@ -1,6 +1,7 @@
 ;;; magit-gerrit.el --- Magit plugin for Gerrit Code Review  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2013-2026 Brian Fransioli
+;; Copyright (C) 2013-2025 Brian Fransioli
+;; Copyright (C) 2025-2026 Abdelhak Bougouffa
 
 ;; Author: Brian Fransioli <assem@terranpro.org>
 ;; Author: Abdelhak Bougouffa
@@ -574,6 +575,16 @@ Succeed even if branch already exist
   (interactive)
   (magit-gerrit-copy-review t))
 
+(defun magit-gerrit-copy-ref (&optional select-number)
+  "Copy review's reference hash, ask for patchset when SELECT-NUMBER."
+  (interactive "P")
+  (if-let* ((ref (magit-gerrit-get-ref select-number)))
+      (with-temp-buffer
+        (insert ref)
+        (clipboard-kill-region (point-min) (point-max))
+        (message "Copied %S to clipboard." ref))
+    (user-error "No Gerrit revision at point")))
+
 (defun magit-gerrit-insert-reviews-section ()
   (magit-gerrit-section 'gerrit-reviews "Reviews:" 'magit-gerrit-wash-reviews (string-join (magit-gerrit--query) " ")))
 
@@ -721,7 +732,8 @@ Succeed even if branch already exist
     ("V" "Verify"                          magit-gerrit-verify-review)]]
   ["Others"
    ("y" "Copy review URL"                  magit-gerrit-copy-review-url)
-   ("Y" "Copy review URL and message"      magit-gerrit-copy-review-url-commit-message)])
+   ("Y" "Copy review URL and message"      magit-gerrit-copy-review-url-commit-message)
+   ("r" "Copy review reference (hash)"     magit-gerrit-copy-ref)])
 
 (defvar magit-gerrit-mode-map
   (let ((map (make-sparse-keymap)))
