@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Fake Gerrit REST server, for the tests.
+
+It listens on 127.0.0.1 on a free port, printed on its standard output.
+Like Gerrit, the requests on /a/... must be authenticated (HTTP basic
+authentication, user "tester", password "s3cret"), the JSON responses
+start with the anti-XSSI prefix )]}' and unknown query options are
+refused.  Each request is saved in $MAGIT_GERRIT_TEST_STATE/rest-last.json
+(and appended to rest-calls.log).  The changes come from the JSON
+fixtures of fixtures/rest.  When the file rest-old exists in the state
+directory, the SUBMIT_REQUIREMENTS option is refused, like an old Gerrit.
+"""
+import base64
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlsplit
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "rest")
+STATE = os.environ["MAGIT_GERRIT_TEST_STATE"]
+CREDENTIALS = ("tester", "s3cret")
+OPTIONS = {"CURRENT_REVISION", "ALL_REVISIONS", "DETAILED_LABELS", "LABELS", "DETAILED_ACCOUNTS",
+           "CURRENT_COMMIT", "ALL_COMMITS", "CURRENT_FILES", "ALL_FILES", "MESSAGES",
+           "SUBMITTABLE", "SUBMIT_REQUIREMENTS"}
+STARRED = os.path.join(STATE, "rest-starred")
+OLD = os.path.join(STATE, "rest-old")
+
+
+def fixture(name):
+    with open(os.path.join(FIXTURES, name), encoding="utf-8") as f:
+        return json.load(f)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def send(self, status, obj=None, text=None):
+        if obj is not None:
+            data = (")]}'\n" + json.dumps(obj, ensure_ascii=False)).encode("utf-8")
+            ctype = "application/json; charset=UTF-8"
+        else:
+            data = (text or "").encode("utf-8")
+            ctype = "text/plain; charset=UTF-8"
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def authenticated(self):
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return None
+        user, _, password = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+        return user if (user, password) == CREDENTIALS else None
+
+    def record(self, method, path, query, body, user):
+        entry = {"method": method, "path": path, "query": query, "body": body, "user": user,
+                 "content_type": self.headers.get("Content-Type")}
+        with open(os.path.join(STATE, "rest-last.json"), "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False)
+        with open(os.path.join(STATE, "rest-calls.log"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def handle_method(self, method):
+        parts = urlsplit(self.path)
+        raw_path = parts.path
+        query = parse_qs(parts.query, keep_blank_values=True)
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        body = json.loads(raw.decode("utf-8")) if raw else None
+        user = None
+        if raw_path.startswith("/a/"):
+            user = self.authenticated()
+            if user is None:
+                self.record(method, raw_path, query, body, None)
+                return self.send(401, text="Unauthorized")
+            raw_path = raw_path[2:]
+        # Decode the segments, keeping the encoded slashes distinct
+        segments = [unquote(s) for s in raw_path.split("/")[1:]]
+        path = "/" + "/".join(segments)
+        self.record(method, path, query, body, user)
+        if method != "GET" and user is None:
+            return self.send(403, text="Authentication required")
+        if body and "fail" in json.dumps(body):
+            return self.send(409, text="Conflict: change is closed")
+        options = query.get("o", [])
+        for option in options:
+            if option not in OPTIONS or (os.path.exists(OLD) and option == "SUBMIT_REQUIREMENTS"):
+                return self.send(400, text='"%s" is not a valid value for "-o"' % option)
+        return self.route(method, segments, query, body, user)
+
+    def route(self, method, segments, query, body, user):
+        changes = fixture("changes.json")
+        if segments == ["tools", "hooks", "commit-msg"]:
+            return self.send(200, text="#!/bin/sh\n# gerrit hook (rest)\n")
+        if segments == ["changes", ""] and method == "GET":
+            q = query.get("q", [""])[0]
+            if "change:bad" in q:
+                return self.send(400, text="bad query: syntax error")
+            if "is:starred" in q:
+                return self.send(200, changes[:1] if os.path.exists(STARRED) else [])
+            if "change:I" in q:
+                return self.send(200, [c for c in changes if "change:" + c["change_id"] in q])
+            if "limit:1" in q:
+                return self.send(200, changes[:1])
+            return self.send(200, changes)
+        if segments == ["accounts", ""] and method == "GET":
+            return self.send(200, [{"_account_id": 1005, "name": "Alice", "email": "alice@example.com"}])
+        if segments[:3] == ["accounts", "self", "starred.changes"]:
+            if method == "PUT":
+                open(STARRED, "w").close()
+            elif os.path.exists(STARRED):
+                os.remove(STARRED)
+            return self.send(204)
+        if segments[0] != "changes" or len(segments) < 2:
+            return self.send(404, text="Not found")
+        number, rest = segments[1], segments[2:]
+        if number != "1234":
+            return self.send(404, text="Not found: %s" % number)
+        if method == "GET":
+            if rest == []:
+                change = fixture("change-1234.json")
+                if "SUBMIT_REQUIREMENTS" not in query.get("o", []):
+                    del change["submit_requirements"]
+                return self.send(200, change)
+            if rest == ["comments"]:
+                return self.send(200, fixture("comments-1234.json"))
+            if rest == ["drafts"]:
+                return self.send(200, fixture("drafts-1234.json") if user else {})
+            if rest == ["revisions", "current", "related"]:
+                return self.send(200, fixture("related-1234.json"))
+            if rest == ["suggest_reviewers"]:
+                return self.send(200, [{"account": {"_account_id": 1005, "name": "Alice",
+                                                    "email": "alice@example.com"}},
+                                       {"group": {"id": "g1", "name": "Developers"}}])
+            return self.send(404, text="Not found")
+        if rest in (["revert"],) or (len(rest) == 3 and rest[2] == "cherrypick"):
+            new = dict(changes[1], _number=1300 if rest == ["revert"] else 1301)
+            return self.send(200, new)
+        if len(rest) >= 3 and rest[2] == "drafts":
+            if method == "PUT" and len(rest) == 3:
+                return self.send(201, dict(body, id="new-draft", patch_set=3))
+            if method == "PUT":
+                return self.send(200, dict(body, id=rest[3]))
+            return self.send(204)
+        if method == "DELETE":
+            return self.send(204)
+        if len(rest) == 3 and rest[2] == "review":
+            return self.send(200, {"labels": (body or {}).get("labels", {})})
+        if rest == ["topic"]:
+            return self.send(200, body.get("topic"))
+        if rest == ["hashtags"]:
+            return self.send(200, ["perf"] + body.get("add", []))
+        return self.send(200, changes[0])
+
+    def do_GET(self):
+        self.handle_method("GET")
+
+    def do_POST(self):
+        self.handle_method("POST")
+
+    def do_PUT(self):
+        self.handle_method("PUT")
+
+    def do_DELETE(self):
+        self.handle_method("DELETE")
+
+
+def main():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    print(server.server_address[1], flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

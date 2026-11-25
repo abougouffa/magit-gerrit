@@ -1,0 +1,152 @@
+[
+ {
+  "id": "foo%2Fbar~1234",
+  "project": "foo/bar",
+  "branch": "main",
+  "topic": "feat",
+  "hashtags": [
+   "perf",
+   "ui"
+  ],
+  "change_id": "I0123456789abcdef0123456789abcdef01234567",
+  "subject": "Add a fancy feature",
+  "status": "NEW",
+  "created": "2023-11-14 22:13:20.000000000",
+  "updated": "2023-11-14 23:13:20.000000000",
+  "submittable": false,
+  "insertions": 42,
+  "deletions": 7,
+  "_number": 1234,
+  "owner": {
+   "_account_id": 1000,
+   "name": "Jane Doe",
+   "email": "jane@example.com",
+   "username": "jane"
+  },
+  "labels": {
+   "Code-Review": {
+    "approved": {
+     "_account_id": 1001,
+     "name": "Bob",
+     "email": "bob@example.com",
+     "username": "bob"
+    },
+    "all": [
+     {
+      "_account_id": 1001,
+      "name": "Bob",
+      "email": "bob@example.com",
+      "username": "bob",
+      "value": 2,
+      "date": "2023-11-14 22:15:00.000000000"
+     },
+     {
+      "_account_id": 1002,
+      "name": "CI",
+      "username": "ci",
+      "value": 0
+     }
+    ],
+    "values": {
+     "-2": "Do not submit",
+     "-1": "I would prefer not",
+     " 0": "No score",
+     "+1": "Looks good to me, but",
+     "+2": "Looks good to me, approved"
+    },
+    "default_value": 0
+   },
+   "Verified": {
+    "rejected": {
+     "_account_id": 1002,
+     "name": "CI",
+     "username": "ci"
+    },
+    "all": [
+     {
+      "_account_id": 1002,
+      "name": "CI",
+      "username": "ci",
+      "value": -1,
+      "date": "2023-11-14 22:16:40.000000000"
+     }
+    ],
+    "values": {
+     "-1": "Fails",
+     " 0": "No score",
+     "+1": "Verified"
+    },
+    "default_value": 0
+   },
+   "Zuul-Gate": {
+    "optional": true,
+    "all": [],
+    "values": {
+     " 0": "No score",
+     "+1": "Gate"
+    }
+   }
+  },
+  "current_revision": "aaaabbbbccccddddeeeeffff0000111122223333",
+  "revisions": {
+   "aaaabbbbccccddddeeeeffff0000111122223333": {
+    "kind": "REWORK",
+    "_number": 3,
+    "created": "2023-11-14 22:13:20.000000000",
+    "uploader": {
+     "_account_id": 1000,
+     "name": "Jane Doe",
+     "email": "jane@example.com",
+     "username": "jane"
+    },
+    "ref": "refs/changes/34/1234/3"
+   }
+  }
+ },
+ {
+  "id": "foo%2Fbar~1240",
+  "project": "foo/bar",
+  "branch": "stable-1.0",
+  "change_id": "Ifedcba9876543210fedcba9876543210fedcba98",
+  "subject": "Fix the broken thing — ünïcödé 日本語",
+  "status": "NEW",
+  "work_in_progress": true,
+  "created": "2023-11-14 22:13:20.000000000",
+  "updated": "2023-07-22 04:26:40.000000000",
+  "submittable": false,
+  "insertions": 1,
+  "deletions": 0,
+  "_number": 1240,
+  "owner": {
+   "_account_id": 1004,
+   "name": "李小龍",
+   "username": "lee"
+  },
+  "labels": {
+   "Code-Review": {
+    "all": [],
+    "values": {
+     "-2": "Do not submit",
+     "-1": "I would prefer not",
+     " 0": "No score",
+     "+1": "Looks good to me, but",
+     "+2": "Looks good to me, approved"
+    }
+   }
+  },
+  "current_revision": "1111222233334444555566667777888899990000",
+  "revisions": {
+   "1111222233334444555566667777888899990000": {
+    "kind": "REWORK",
+    "_number": 1,
+    "ref": "refs/changes/40/1240/1",
+    "uploader": {
+     "_account_id": 1004,
+     "name": "李小龍",
+     "username": "lee"
+    },
+    "created": "2023-11-14 22:13:20.000000000"
+   }
+  }
+ }
+]

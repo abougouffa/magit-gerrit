@@ -1,0 +1,40 @@
+{
+ "changes": [
+  {
+   "project": "foo/bar",
+   "change_id": "I5",
+   "commit": {
+    "commit": "5555",
+    "subject": "Use the feature"
+   },
+   "_change_number": 1250,
+   "_revision_number": 2,
+   "_current_revision_number": 2,
+   "status": "NEW"
+  },
+  {
+   "project": "foo/bar",
+   "change_id": "I0123456789abcdef0123456789abcdef01234567",
+   "commit": {
+    "commit": "aaaabbbbccccddddeeeeffff0000111122223333",
+    "subject": "Add a fancy feature"
+   },
+   "_change_number": 1234,
+   "_revision_number": 3,
+   "_current_revision_number": 3,
+   "status": "NEW"
+  },
+  {
+   "project": "foo/bar",
+   "change_id": "I3",
+   "commit": {
+    "commit": "3333",
+    "subject": "Prepare"
+   },
+   "_change_number": 1230,
+   "_revision_number": 1,
+   "_current_revision_number": 2,
+   "status": "NEW"
+  }
+ ]
+}

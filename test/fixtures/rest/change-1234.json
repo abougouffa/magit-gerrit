@@ -1,0 +1,221 @@
+{
+ "id": "foo%2Fbar~1234",
+ "project": "foo/bar",
+ "branch": "main",
+ "topic": "feat",
+ "hashtags": [
+  "perf",
+  "ui"
+ ],
+ "change_id": "I0123456789abcdef0123456789abcdef01234567",
+ "subject": "Add a fancy feature",
+ "status": "NEW",
+ "created": "2023-11-14 22:13:20.000000000",
+ "updated": "2023-11-14 23:13:20.000000000",
+ "submittable": false,
+ "insertions": 42,
+ "deletions": 7,
+ "_number": 1234,
+ "owner": {
+  "_account_id": 1000,
+  "name": "Jane Doe",
+  "email": "jane@example.com",
+  "username": "jane"
+ },
+ "labels": {
+  "Code-Review": {
+   "approved": {
+    "_account_id": 1001,
+    "name": "Bob",
+    "email": "bob@example.com",
+    "username": "bob"
+   },
+   "all": [
+    {
+     "_account_id": 1001,
+     "name": "Bob",
+     "email": "bob@example.com",
+     "username": "bob",
+     "value": 2,
+     "date": "2023-11-14 22:15:00.000000000"
+    },
+    {
+     "_account_id": 1002,
+     "name": "CI",
+     "username": "ci",
+     "value": 0
+    }
+   ],
+   "values": {
+    "-2": "Do not submit",
+    "-1": "I would prefer not",
+    " 0": "No score",
+    "+1": "Looks good to me, but",
+    "+2": "Looks good to me, approved"
+   },
+   "default_value": 0
+  },
+  "Verified": {
+   "rejected": {
+    "_account_id": 1002,
+    "name": "CI",
+    "username": "ci"
+   },
+   "all": [
+    {
+     "_account_id": 1002,
+     "name": "CI",
+     "username": "ci",
+     "value": -1,
+     "date": "2023-11-14 22:16:40.000000000"
+    }
+   ],
+   "values": {
+    "-1": "Fails",
+    " 0": "No score",
+    "+1": "Verified"
+   },
+   "default_value": 0
+  },
+  "Zuul-Gate": {
+   "optional": true,
+   "all": [],
+   "values": {
+    " 0": "No score",
+    "+1": "Gate"
+   }
+  }
+ },
+ "current_revision": "aaaabbbbccccddddeeeeffff0000111122223333",
+ "revisions": {
+  "1111aaaa0000000000000000000000000000aaaa": {
+   "kind": "REWORK",
+   "_number": 1,
+   "created": "2023-11-03 08:26:40.000000000",
+   "uploader": {
+    "_account_id": 1000,
+    "name": "Jane Doe",
+    "email": "jane@example.com",
+    "username": "jane"
+   },
+   "ref": "refs/changes/34/1234/1"
+  },
+  "aaaabbbbccccddddeeeeffff0000111122223333": {
+   "kind": "REWORK",
+   "_number": 3,
+   "created": "2023-11-14 22:13:20.000000000",
+   "uploader": {
+    "_account_id": 1000,
+    "name": "Jane Doe",
+    "email": "jane@example.com",
+    "username": "jane"
+   },
+   "ref": "refs/changes/34/1234/3",
+   "commit": {
+    "parents": [
+     {
+      "commit": "9999"
+     }
+    ],
+    "subject": "Add a fancy feature",
+    "message": "Add a fancy feature\n\nBody\n\nChange-Id: I0123456789abcdef0123456789abcdef01234567\n"
+   },
+   "files": {
+    "/COMMIT_MSG": {
+     "status": "A",
+     "lines_inserted": 9
+    },
+    "src/a.c": {
+     "lines_inserted": 40,
+     "lines_deleted": 7
+    },
+    "doc/new.md": {
+     "status": "A",
+     "lines_inserted": 2
+    },
+    "src/old_name.c": {
+     "status": "R",
+     "old_path": "src/b.c",
+     "lines_inserted": 0,
+     "lines_deleted": 0
+    }
+   }
+  }
+ },
+ "reviewers": {
+  "REVIEWER": [
+   {
+    "_account_id": 1001,
+    "name": "Bob",
+    "email": "bob@example.com",
+    "username": "bob"
+   },
+   {
+    "_account_id": 1002,
+    "name": "CI",
+    "username": "ci"
+   }
+  ],
+  "CC": [
+   {
+    "_account_id": 1003,
+    "name": "Carl",
+    "email": "carl@example.com",
+    "username": "carl"
+   }
+  ]
+ },
+ "permitted_labels": {
+  "Code-Review": [
+   "-1",
+   " 0",
+   "+1"
+  ],
+  "Verified": [
+   "-1",
+   " 0",
+   "+1"
+  ]
+ },
+ "submit_requirements": [
+  {
+   "name": "Code-Review",
+   "status": "SATISFIED"
+  },
+  {
+   "name": "Verified",
+   "status": "UNSATISFIED"
+  }
+ ],
+ "messages": [
+  {
+   "id": "m1",
+   "author": {
+    "_account_id": 1002,
+    "name": "CI",
+    "username": "ci"
+   },
+   "date": "2023-11-03 08:28:20.000000000",
+   "message": "Patch Set 1: Verified+1",
+   "_revision_number": 1
+  },
+  {
+   "id": "m2",
+   "author": {
+    "_account_id": 1001,
+    "name": "Bob",
+    "email": "bob@example.com",
+    "username": "bob"
+   },
+   "date": "2023-11-14 22:15:00.000000000",
+   "message": "Patch Set 3: Code-Review+2\n\nLooks good.",
+   "_revision_number": 3
+  },
+  {
+   "id": "m3",
+   "date": "2023-11-14 22:20:00.000000000",
+   "message": "Uploaded patch set 3.",
+   "_revision_number": 3
+  }
+ ]
+}

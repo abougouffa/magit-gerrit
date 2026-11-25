@@ -1,0 +1,19 @@
+{
+ "doc/new.md": [
+  {
+   "id": "d1",
+   "patch_set": 3,
+   "line": 1,
+   "author": {
+    "_account_id": 1000,
+    "name": "Jane Doe",
+    "email": "jane@example.com",
+    "username": "jane"
+   },
+   "message": "Mention the option",
+   "unresolved": true,
+   "updated": "2023-11-15 08:00:00.000000000",
+   "commit_id": "aaaabbbbccccddddeeeeffff0000111122223333"
+  }
+ ]
+}

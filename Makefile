@@ -9,10 +9,12 @@
 EMACS    ?= emacs
 ELPA_DIR ?= $(CURDIR)/.elpa
 INIT     ?= --eval '(progn (setq package-user-dir "$(ELPA_DIR)") (package-initialize))'
-BATCH     = $(EMACS) -Q --batch $(INIT) -L .
+BATCH     = $(EMACS) -Q --batch --eval "(setq load-prefer-newer t)" $(INIT) -L .
 
-EL  = magit-gerrit.el
-ELC = $(EL:.el=.elc)
+MAIN = magit-gerrit.el
+EL   = $(MAIN) magit-gerrit-ssh.el magit-gerrit-rest.el
+ELC  = $(EL:.el=.elc)
+TESTS = test/magit-gerrit-test.el test/magit-gerrit-rest-test.el
 
 .PHONY: all deps compile checkdoc lint test clean
 
@@ -32,15 +34,19 @@ compile:
 
 checkdoc:
 	@$(BATCH) --eval "(require 'checkdoc)" \
-	  --eval '(checkdoc-file "$(EL)")' 2>&1 | tee checkdoc.log
-	@if grep -q "^Warning" checkdoc.log; then rm -f checkdoc.log; exit 1; fi
+	  $(foreach f,$(EL),--eval '(checkdoc-file "$(f)")') 2>&1 | tee checkdoc.log
+	@if grep -q "^Warning\|^[^ ]*\.el:[0-9]" checkdoc.log; then rm -f checkdoc.log; exit 1; fi
 	@rm -f checkdoc.log
 
+# The secondary files are linted against the package headers of $(MAIN)
 lint:
-	$(BATCH) --eval "(require 'package-lint)" -f package-lint-batch-and-exit $(EL)
+	$(BATCH) --eval "(require 'package-lint)" -f package-lint-batch-and-exit $(MAIN)
+	$(BATCH) --eval "(require 'package-lint)" \
+	  --eval '(setq package-lint-main-file "$(MAIN)")' \
+	  -f package-lint-batch-and-exit $(filter-out $(MAIN),$(EL))
 
 test:
-	$(BATCH) -L test -l test/magit-gerrit-test.el -f ert-run-tests-batch-and-exit
+	$(BATCH) -L test $(foreach f,$(TESTS),-l $(f)) -f ert-run-tests-batch-and-exit
 
 clean:
 	rm -f $(ELC) test/*.elc

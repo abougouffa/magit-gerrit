@@ -1,0 +1,82 @@
+{
+ "src/a.c": [
+  {
+   "id": "c0",
+   "patch_set": 1,
+   "line": 12,
+   "author": {
+    "_account_id": 1001,
+    "name": "Bob",
+    "email": "bob@example.com",
+    "username": "bob"
+   },
+   "message": "Typo here",
+   "unresolved": false,
+   "updated": "2023-11-03 09:00:00.000000000",
+   "commit_id": "1111aaaa0000000000000000000000000000aaaa"
+  },
+  {
+   "id": "c1",
+   "patch_set": 3,
+   "line": 40,
+   "author": {
+    "_account_id": 1001,
+    "name": "Bob",
+    "email": "bob@example.com",
+    "username": "bob"
+   },
+   "message": "Can this overflow?\nPlease check.",
+   "unresolved": true,
+   "updated": "2023-11-14 22:15:00.000000000",
+   "commit_id": "aaaabbbbccccddddeeeeffff0000111122223333"
+  },
+  {
+   "id": "c2",
+   "patch_set": 3,
+   "line": 40,
+   "in_reply_to": "c1",
+   "author": {
+    "_account_id": 1000,
+    "name": "Jane Doe",
+    "email": "jane@example.com",
+    "username": "jane"
+   },
+   "message": "It can't, the input is bounded.",
+   "unresolved": true,
+   "updated": "2023-11-14 22:30:00.000000000",
+   "commit_id": "aaaabbbbccccddddeeeeffff0000111122223333"
+  },
+  {
+   "id": "c3",
+   "patch_set": 3,
+   "line": 7,
+   "side": "PARENT",
+   "author": {
+    "_account_id": 1001,
+    "name": "Bob",
+    "email": "bob@example.com",
+    "username": "bob"
+   },
+   "message": "Why remove this?",
+   "unresolved": false,
+   "updated": "2023-11-14 22:16:00.000000000",
+   "commit_id": "aaaabbbbccccddddeeeeffff0000111122223333"
+  }
+ ],
+ "/PATCHSET_LEVEL": [
+  {
+   "id": "c4",
+   "patch_set": 3,
+   "author": {
+    "_account_id": 1001,
+    "name": "Bob",
+    "email": "bob@example.com",
+    "username": "bob"
+   },
+   "message": "Nice work overall.",
+   "unresolved": false,
+   "updated": "2023-11-14 22:15:00.000000000",
+   "commit_id": "aaaabbbbccccddddeeeeffff0000111122223333"
+  }
+ ]
+}

@@ -3,11 +3,11 @@
 ;; Copyright (C) 2013-2025 Brian Fransioli
 ;; Copyright (C) 2025-2026 Abdelhak Bougouffa
 
-;; Author: Brian Fransioli <assem@terranpro.org>
 ;; Author: Abdelhak Bougouffa
+;; Author: Brian Fransioli
 ;; URL: https://github.com/abougouffa/magit-gerrit
 ;; Package-Requires: ((emacs "29.1") (magit "4.0.0") (transient "0.5.0"))
-;; Package-Version: 0.2.0
+;; Package-Version: 0.3.0
 
 ;; This program is free software; you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License as
@@ -25,8 +25,9 @@
 
 ;;; Commentary:
 
-;; Magit plugin for Gerrit Code Review: review, vote, push and manage
-;; changes from Emacs, through Gerrit's SSH interface.
+;; Magit plugin for Gerrit Code Review: review, vote, comment, push and
+;; manage changes from Emacs, through Gerrit's SSH interface or its REST
+;; API.
 ;;
 ;; - A "Reviews" section in `magit-status', with query presets.
 ;; - A buffer showing the details of a change: labels, submit
@@ -34,6 +35,10 @@
 ;;   and inline comments (`magit-gerrit-show-change').
 ;; - Votes on any label, submit, abandon, restore, rebase, move, and
 ;;   management of reviewers, CCs, topics and the WIP state.
+;; - Inline comments on the lines of a patchset; with the REST API,
+;;   replies, resolution of comment threads and draft comments.
+;; - With the REST API: hashtags, stars, private changes, edition of
+;;   the commit message, reverts and cherry-picks on the server.
 ;; - A push menu with Gerrit's push options (`magit-gerrit-push').
 ;; - Viewing, checking out and cherry-picking patchsets.
 ;; - The change of commits in revision and log buffers.
@@ -48,9 +53,17 @@
 ;; This enables `magit-gerrit-mode' in the Magit buffers of
 ;; repositories whose remote ("origin" or "gerrit", see
 ;; `magit-gerrit-remote') is an SSH URL on Gerrit's port, such as
-;; ssh://john@review.example.com:29418/project.  Otherwise, set
-;; `magit-gerrit-ssh-creds' (and `magit-gerrit-force-enable') in a
-;; .dir-locals.el file.
+;; ssh://john@review.example.com:29418/project, or an HTTPS URL of a
+;; Gerrit server listed in `magit-gerrit-rest-hosts'.  Otherwise, set
+;; `magit-gerrit-ssh-creds' or `magit-gerrit-rest-url' (and
+;; `magit-gerrit-force-enable') in a .dir-locals.el file.
+;;
+;; Backends: the frontend (this file) talks to Gerrit through a backend,
+;; chosen with `magit-gerrit-backend'.  The SSH backend
+;; (magit-gerrit-ssh.el) runs Gerrit's SSH commands, the REST backend
+;; (magit-gerrit-rest.el) uses its REST API, which offers more features
+;; (replies to comments, drafts, hashtags...).  The commands needing a
+;; feature the backend lacks are shown as unavailable in the menus.
 ;;
 ;; Press "_" (`magit-gerrit-popup-prefix') in a Magit buffer to open the
 ;; Gerrit menu.  A typical workflow:
@@ -59,6 +72,8 @@
 ;; 2) "_ P p" pushes the commit at point for review,
 ;; 3) "_ A" adds reviewers,
 ;; 4) RET on a change in the Reviews section shows its comments,
+;;    "_ C" comments on the line at point of a patchset diff and "_ a"
+;;    replies to the comment at point,
 ;; 5) "_ v" votes and "_ S" submits.
 ;;
 ;; See the README for the full documentation.
@@ -87,15 +102,38 @@ Otherwise, the fetch URL is used (see \"git remote get-url\")."
   :group 'magit-gerrit
   :type 'boolean)
 
-(defcustom magit-gerrit-ssh-program "ssh"
-  "The SSH program used to run Gerrit commands."
+(defcustom magit-gerrit-backend 'auto
+  "The backend used to talk to Gerrit.
+`ssh' runs the commands of Gerrit's SSH daemon (see
+magit-gerrit-ssh.el), `rest' uses Gerrit's REST API over HTTP(S),
+which offers more features (see magit-gerrit-rest.el).  `auto' uses
+the first backend of `magit-gerrit-auto-backends' that matches the
+remote of the repository.  Other backends can be added with
+`magit-gerrit-register-backend'."
   :group 'magit-gerrit
-  :type 'string)
+  :type '(choice (const :tag "Automatic" auto)
+                 (const :tag "SSH commands" ssh)
+                 (const :tag "REST API" rest)
+                 (symbol :tag "Other backend")))
+(put 'magit-gerrit-backend 'safe-local-variable #'symbolp)
 
-(defcustom magit-gerrit-scp-program "scp"
-  "The scp program used to download the commit-msg hook."
+(defcustom magit-gerrit-auto-backends '(rest ssh)
+  "Backends tried, in order, when `magit-gerrit-backend' is `auto'.
+The first one serving the remote of the repository is used, the REST
+backend is only used when it is configured (see
+`magit-gerrit-rest-url' and `magit-gerrit-rest-hosts')."
   :group 'magit-gerrit
-  :type 'string)
+  :type '(repeat symbol))
+
+(defcustom magit-gerrit-read-message-function #'magit-gerrit-read-message-in-buffer
+  "Function reading the text of comments and of commit messages.
+It is called with a PROMPT, a CONTEXT shown above the text (or nil),
+the INITIAL text (or nil) and a CALLBACK, which it calls with the text
+when it is done (it doesn't call it when the input is cancelled)."
+  :group 'magit-gerrit
+  :type '(choice (function-item magit-gerrit-read-message-in-buffer)
+                 (function-item magit-gerrit-read-message-in-minibuffer)
+                 function))
 
 (defcustom magit-gerrit-web-url nil
   "The base URL of the Gerrit web interface (e.g. \"https://host/r\").
@@ -109,7 +147,8 @@ from the host of the remote as \"https://HOST\"."
   "Methods tried, in order, to download Gerrit's commit-msg hook.
 `https' downloads it from the web interface (see
 `magit-gerrit-web-url'), `scp' from the SSH daemon (with the legacy
-scp protocol, Gerrit doesn't support SFTP)."
+scp protocol, Gerrit doesn't support SFTP).  The methods are
+implemented by the functions of `magit-gerrit-commit-msg-hook-downloaders'."
   :group 'magit-gerrit
   :type '(repeat (choice (const https) (const scp))))
 
@@ -155,7 +194,8 @@ The key opening `magit-gerrit-dispatch' is `magit-gerrit-popup-prefix'.")
   "Range of the values of the review labels, as (LABEL MIN . MAX).
 Gerrit's SSH interface doesn't tell which values a label accepts, add
 the custom labels of your projects here.  Labels not listed here use
-`magit-gerrit-default-label-values'."
+`magit-gerrit-default-label-values'.  The REST backend gets the values
+of the labels from the server, they take precedence."
   :group 'magit-gerrit
   :type '(alist :key-type (string :tag "Label")
                 :value-type (cons (integer :tag "Min") (integer :tag "Max"))))
@@ -256,16 +296,14 @@ parameter of `magit-insert-section'."
     magit-gerrit-insert-change-files
     magit-gerrit-insert-change-patchsets
     magit-gerrit-insert-change-messages
-    magit-gerrit-insert-change-comments)
+    magit-gerrit-insert-change-comments
+    magit-gerrit-insert-change-drafts)
   "Hook run to insert sections into a Gerrit change buffer."
   :group 'magit-gerrit
   :type 'hook)
 
 
 ;;; Per-repository variables
-
-(defvar-local magit-gerrit-ssh-creds nil
-  "Credentials used to execute gerrit commands via ssh of the form ID@Server.")
 
 (defvar-local magit-gerrit-remote "origin"
   "Default remote name to use for gerrit (e.g. \"origin\", \"gerrit\").")
@@ -276,9 +314,6 @@ parameter of `magit-insert-section'."
 (defvar-local magit-gerrit-force-enable nil
   "Force enabling `magit-gerrit' for the project.")
 
-(defvar-local magit-gerrit-port 29418
-  "The default port to use with the Gerrit host.")
-
 ;; https://gerrit-review.googlesource.com/Documentation/user-search.html
 ;; For example we can set it to: "(status:open OR (status:merged AND -age:6months))"
 (defvar-local magit-gerrit-query-filters nil
@@ -288,9 +323,7 @@ See https://gerrit-review.googlesource.com/Documentation/user-search.html")
 (defvar-local magit-gerrit-query-all-projects nil
   "When non-nil, list the reviews of all projects, not only the current one.")
 
-(put 'magit-gerrit-ssh-creds 'safe-local-variable #'stringp)
 (put 'magit-gerrit-remote 'safe-local-variable #'stringp)
-(put 'magit-gerrit-port 'safe-local-variable #'integerp)
 (put 'magit-gerrit-force-enable 'safe-local-variable #'booleanp)
 (put 'magit-gerrit-query-filters 'safe-local-variable #'stringp)
 
@@ -308,94 +341,26 @@ See https://gerrit-review.googlesource.com/Documentation/user-search.html")
   "Cache mapping Change-Ids to Gerrit query results.")
 
 (defconst magit-gerrit-log-buffer-name "*magit-gerrit-log*"
-  "Name of the buffer logging the Gerrit SSH commands.")
+  "Name of the buffer logging the Gerrit commands and requests.")
 
 (defvar magit-gerrit-reviewer-history nil
   "Minibuffer history of reviewers and CCs.")
 (add-to-list 'savehist-additional-variables 'magit-gerrit-reviewer-history)
 
 
-;;; Gerrit SSH commands
+;;; Logging and JSON
 
-(defun magit-gerrit--quote (arg)
-  "Quote ARG for the command line parser of Gerrit's SSH daemon.
-Gerrit splits the command line itself (there is no remote shell), it
-supports POSIX-like single quotes, double quotes and backslashes."
-  (if (string-match-p "\\`[-[:alnum:]_.,:/=@+%^~]+\\'" arg)
-      arg
-    (concat "'" (string-replace "'" "'\\''" arg) "'")))
-
-(defun magit-gerrit--command (cmd &rest args)
-  "Build SSH parameters to run Gerrit's CMD with ARGS.
-ARGS are flattened, nil elements are removed and the remaining ones
-are quoted for Gerrit."
-  `("-x" "-p"
-    ,(number-to-string magit-gerrit-port)
-    ,(or magit-gerrit-ssh-creds
-         (user-error "`magit-gerrit-ssh-creds' must be set!"))
-    "gerrit"
-    ,cmd
-    ,@(mapcar (lambda (arg) (magit-gerrit--quote (format "%s" arg)))
-              (delq nil (flatten-list args)))))
-
-(defun magit-gerrit--log (ssh-args exit-code stderr)
-  "Log the SSH call with SSH-ARGS, its EXIT-CODE and STDERR."
+(defun magit-gerrit--log (command status &optional details)
+  "Log the Gerrit COMMAND (a string), its STATUS and its DETAILS.
+STATUS is the exit code of a command or the HTTP status of a request,
+DETAILS is the error output or the error message, if any.  The log
+is in `magit-gerrit-log-buffer-name'."
   (with-current-buffer (get-buffer-create magit-gerrit-log-buffer-name)
     (let ((inhibit-read-only t))
       (goto-char (point-max))
-      (insert (format "[%s] %s %s => %s\n"
-                      (format-time-string "%F %T")
-                      magit-gerrit-ssh-program
-                      (string-join ssh-args " ")
-                      exit-code))
-      (unless (string-empty-p stderr)
-        (insert stderr "\n")))))
-
-(defun magit-gerrit--ssh-run (input cmd args)
-  "Call Gerrit's command CMD with ARGS via SSH and return its output.
-When INPUT is non-nil, it is sent to the standard input of the
-command.  ARGS are processed as in `magit-gerrit--command'.  Signal a
-`user-error' containing the error output when the command fails.
-All the calls are logged in `magit-gerrit-log-buffer-name'."
-  (let ((ssh-args (apply #'magit-gerrit--command cmd args))
-        (err-file (make-temp-file "magit-gerrit-"))
-        (in-file (when input (make-temp-file "magit-gerrit-in-" nil nil input)))
-        ;; SSH is always run locally, even for remote repositories
-        (default-directory (if (file-remote-p default-directory)
-                               temporary-file-directory
-                             default-directory)))
-    (unwind-protect
-        (with-temp-buffer
-          (let* ((coding-system-for-write 'utf-8)
-                 (coding-system-for-read 'utf-8)
-                 (exit-code (apply #'call-process magit-gerrit-ssh-program
-                                   in-file (list t err-file) nil ssh-args))
-                 (stderr (with-temp-buffer
-                           (insert-file-contents err-file)
-                           (string-trim (buffer-string)))))
-            (magit-gerrit--log ssh-args exit-code stderr)
-            (unless (eq exit-code 0)
-              (user-error "Gerrit command \"%s\" failed: %s" cmd
-                          (if (string-empty-p stderr)
-                              (format "exit code %s" exit-code)
-                            (car (split-string stderr "\n" t)))))
-            (buffer-string)))
-      (delete-file err-file)
-      (when in-file (delete-file in-file)))))
-
-(defun magit-gerrit--ssh-call (cmd &rest args)
-  "Call Gerrit's command CMD with ARGS via SSH and return its output.
-See `magit-gerrit--ssh-run'."
-  (magit-gerrit--ssh-run nil cmd args))
-
-(defun magit-gerrit--review-json (change input)
-  "Run \"gerrit review --json\" on the current patchset of CHANGE.
-INPUT is an alist, sent as a ReviewInput entity, see
-https://gerrit-review.googlesource.com/Documentation/rest-api-changes.html#review-input"
-  (magit-gerrit--ssh-run (json-encode input) "review"
-                         (list "--project" (magit-gerrit-change-project change)
-                               "--json"
-                               (magit-gerrit-change-revision change))))
+      (insert (format "[%s] %s => %s\n" (format-time-string "%F %T") command status))
+      (when (and details (not (string-empty-p details)))
+        (insert details "\n")))))
 
 (defun magit-gerrit--json-parse (string)
   "Parse the JSON object in STRING as an alist, arrays as lists.
@@ -411,47 +376,402 @@ available (always the case since Emacs 30), `json.el' otherwise."
           (json-false nil))
       (json-read-from-string string))))
 
-(defun magit-gerrit--parse-json-lines (output)
-  "Parse OUTPUT of a Gerrit query in JSON format.
-Return the list of changes, as alists.  Signal a `user-error' when
-Gerrit reports an error."
-  (let (changes)
-    (dolist (line (split-string output "\n" t "[ \t\r]+"))
-      (let ((obj (magit-gerrit--json-parse line)))
-        (pcase (alist-get 'type obj)
-          ("stats" nil)
-          ("error" (user-error "Gerrit query failed: %s" (alist-get 'message obj)))
-          (_ (push obj changes)))))
-    (nreverse changes)))
+(defun magit-gerrit--json-encode (object)
+  "Encode OBJECT as compact JSON with `json-encode'.
+Alists are encoded as objects, vectors as arrays, t as true,
+`:json-false' as false and an empty hash table as {}."
+  (let ((json-encoding-pretty-print nil))
+    (json-encode object)))
+
+
+;;; Backends
+
+;; The frontend talks to Gerrit through a backend object, whose type
+;; derives from `magit-gerrit-backend'.  The backends implement the
+;; generic functions below (the `magit-gerrit-backend-' ones) and
+;; declare what they support with `magit-gerrit-backend-features'.  The
+;; operations a backend doesn't implement signal a `user-error'; the
+;; frontend checks the features before offering a command (see
+;; `magit-gerrit--supports-p'), so that the backends can have different
+;; capabilities.
+;;
+;; The backends exchange changes with the frontend in the format of
+;; the JSON of "gerrit query" (see "Change data model" below).
+
+(cl-defstruct (magit-gerrit-backend (:constructor nil) (:copier nil))
+  "Base type of the backends talking to a Gerrit server.")
+
+(defvar magit-gerrit-backends nil
+  "The available backends, as an alist of (NAME . CONSTRUCTOR).
+CONSTRUCTOR is called with the URL of the Gerrit remote (or nil) and
+EXPLICIT, non-nil when the backend was chosen with
+`magit-gerrit-backend'.  It returns a backend, or nil when it can't be
+used for the repository.  See `magit-gerrit-register-backend'.")
+
+(defvar magit-gerrit-backend-variables '(magit-gerrit-backend magit-gerrit-remote)
+  "Variables configuring the backends.
+Their values are passed on to the change buffers, and the backend of a
+buffer is made again when one of them changes.")
+
+(defun magit-gerrit-register-backend (name constructor &rest variables)
+  "Register the backend NAME, made by CONSTRUCTOR.
+See `magit-gerrit-backends' for CONSTRUCTOR.  VARIABLES are the
+variables configuring the backend, see
+`magit-gerrit-backend-variables'."
+  (setf (alist-get name magit-gerrit-backends) constructor)
+  (dolist (var variables)
+    (add-to-list 'magit-gerrit-backend-variables var t)))
+
+(defconst magit-gerrit-query-options
+  '(:current-patch-set :patch-sets :approvals :files :comments :commit-message
+    :dependencies :submit-records :reviewers)
+  "The options of queries, telling which data the changes include.
+:current-patch-set  the current patchset, with its votes and size,
+:patch-sets         all the patchsets,
+:approvals          the votes on all the patchsets,
+:files              the files modified by the patchsets,
+:comments           the messages and the inline comments,
+:commit-message     the commit message of the current patchset,
+:dependencies       the changes it depends on and its dependents,
+:submit-records     whether the change can be submitted,
+:reviewers          the reviewers.")
+
+(defconst magit-gerrit-features
+  '((query . "queries")
+    (async . "asynchronous queries")
+    (vote . "votes")
+    (submit . "submitting changes")
+    (abandon . "abandoning changes")
+    (restore . "restoring changes")
+    (rebase . "rebasing changes")
+    (move . "moving changes")
+    (topic . "topics")
+    (reviewers . "reviewers")
+    (cc . "CCs")
+    (wip . "the work in progress state")
+    (comment . "inline comments")
+    (reply . "replies to comments")
+    (drafts . "draft comments")
+    (label-values . "the values of the labels")
+    (suggest-accounts . "suggestions of accounts")
+    (hashtags . "hashtags")
+    (star . "starred changes")
+    (private . "private changes")
+    (edit-message . "editing commit messages")
+    (revert . "reverting changes")
+    (cherry-pick . "cherry-picking changes on the server"))
+  "The features a backend can support, with their descriptions.
+See `magit-gerrit-backend-features'.")
+
+(defun magit-gerrit--unsupported (backend feature)
+  "Signal that BACKEND doesn't support FEATURE."
+  (user-error "The %s backend doesn't support %s"
+              (magit-gerrit-backend-name backend)
+              (alist-get feature magit-gerrit-features feature)))
+
+(cl-defgeneric magit-gerrit-backend-name (backend)
+  "Return the name of BACKEND, for messages."
+  (symbol-name (type-of backend)))
+
+(cl-defgeneric magit-gerrit-backend-key (backend)
+  "Return a string identifying the server of BACKEND, for caches."
+  (format "%S" backend))
+
+(cl-defgeneric magit-gerrit-backend-features (_backend)
+  "Return the list of the features of BACKEND.
+The features are the keys of `magit-gerrit-features'."
+  nil)
+
+(cl-defgeneric magit-gerrit-backend-matches-remote-p (_backend _remote-url)
+  "Return non-nil when BACKEND is the server of the Git REMOTE-URL.
+This decides whether `magit-gerrit-mode' is enabled automatically."
+  nil)
+
+(cl-defgeneric magit-gerrit-backend-web-url (_backend)
+  "Return the base URL of the web interface of BACKEND, or nil."
+  nil)
+
+(cl-defgeneric magit-gerrit-backend-query (backend query options)
+  "Run QUERY on BACKEND, return the list of matching change objects.
+QUERY is a string or a list of query terms, see
+https://gerrit-review.googlesource.com/Documentation/user-search.html
+OPTIONS are keywords of `magit-gerrit-query-options', telling which
+data the changes must include."
+  (:method (backend _query _options) (magit-gerrit--unsupported backend 'query)))
+
+(cl-defgeneric magit-gerrit-backend-query-async (backend query options callback)
+  "Run QUERY with OPTIONS on BACKEND in the background.
+See `magit-gerrit-backend-query' for QUERY and OPTIONS.  CALLBACK is
+called with the list of changes and nil, or with nil and an error
+message.  The default method runs the query when Emacs is idle."
+  (run-at-time 0 nil
+               (lambda ()
+                 (condition-case err
+                     (funcall callback (magit-gerrit-backend-query backend query options) nil)
+                   (error (funcall callback nil (error-message-string err))))))
+  nil)
+
+(cl-defgeneric magit-gerrit-backend-get-change (backend number)
+  "Return the change NUMBER with all its details from BACKEND, or nil.
+The default method queries it with all the
+`magit-gerrit-query-options'."
+  (car (magit-gerrit-backend-query backend (format "change:%s" number)
+                                   magit-gerrit-query-options)))
+
+(cl-defgeneric magit-gerrit-backend-vote (backend change votes options)
+  "Vote VOTES on the current patchset of CHANGE with BACKEND.
+VOTES is a list of \"LABEL=VALUE\" strings.  OPTIONS is a plist with
+the properties :message (posted with the votes), :notify (who to
+notify) and :submit (submit after voting)."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'vote)))
+
+(cl-defgeneric magit-gerrit-backend-submit (backend change options)
+  "Submit CHANGE with BACKEND.
+OPTIONS is a plist with the properties :message and :notify."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'submit)))
+
+(cl-defgeneric magit-gerrit-backend-abandon (backend change options)
+  "Abandon CHANGE with BACKEND.
+OPTIONS is a plist with the properties :message and :notify."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'abandon)))
+
+(cl-defgeneric magit-gerrit-backend-restore (backend change options)
+  "Restore the abandoned CHANGE with BACKEND.
+OPTIONS is a plist with the properties :message and :notify."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'restore)))
+
+(cl-defgeneric magit-gerrit-backend-rebase (backend change options)
+  "Rebase CHANGE on Gerrit with BACKEND.
+OPTIONS is a plist with the properties :message and :notify."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'rebase)))
+
+(cl-defgeneric magit-gerrit-backend-move (backend change branch options)
+  "Move CHANGE to BRANCH with BACKEND.
+OPTIONS is a plist with the properties :message and :notify."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'move)))
+
+(cl-defgeneric magit-gerrit-backend-set-topic (backend change topic)
+  "Set the TOPIC of CHANGE with BACKEND, remove it when TOPIC is nil."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'topic)))
+
+(cl-defgeneric magit-gerrit-backend-add-reviewers (backend change accounts &optional cc)
+  "Add ACCOUNTS as reviewers of CHANGE with BACKEND.
+When CC is non-nil, add them in CC instead."
+  (:method (backend _change _accounts &optional cc)
+           (magit-gerrit--unsupported backend (if cc 'cc 'reviewers))))
+
+(cl-defgeneric magit-gerrit-backend-remove-reviewers (backend change accounts)
+  "Remove ACCOUNTS from the reviewers (or CCs) of CHANGE with BACKEND."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'reviewers)))
+
+(cl-defgeneric magit-gerrit-backend-set-wip (backend change wip options)
+  "Mark CHANGE as work in progress when WIP is non-nil, as ready otherwise.
+BACKEND is the backend, OPTIONS a plist with the property :message."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'wip)))
+
+(cl-defgeneric magit-gerrit-backend-post-comments (backend change revision comments options)
+  "Post inline COMMENTS on REVISION of CHANGE with BACKEND.
+REVISION is a commit hash.  COMMENTS is a list of plists with the
+properties :file, :line (nil for a file comment), :side
+\(\"REVISION\" or \"PARENT\"), :message, :unresolved and :in-reply-to
+\(the id of the comment replied to).  OPTIONS is a plist with the
+properties :message (a message posted with the comments), :notify
+and :draft (save the comments as drafts instead of posting them)."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'comment)))
+
+(cl-defgeneric magit-gerrit-backend-update-draft (backend change draft message unresolved)
+  "Set the MESSAGE and the UNRESOLVED state of the DRAFT of CHANGE.
+BACKEND is the backend, DRAFT a draft comment of the change."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'drafts)))
+
+(cl-defgeneric magit-gerrit-backend-delete-draft (backend change draft)
+  "Delete the DRAFT comment of CHANGE with BACKEND."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'drafts)))
+
+(cl-defgeneric magit-gerrit-backend-publish-drafts (backend change options)
+  "Publish the draft comments of CHANGE with BACKEND.
+OPTIONS is a plist with the properties :message and :notify."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'drafts)))
+
+(cl-defgeneric magit-gerrit-backend-set-hashtags (backend change add remove)
+  "Add the hashtags ADD to CHANGE and remove the hashtags REMOVE.
+BACKEND is the backend."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'hashtags)))
+
+(cl-defgeneric magit-gerrit-backend-set-starred (backend change starred)
+  "Star CHANGE with BACKEND when STARRED is non-nil, unstar it otherwise."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'star)))
+
+(cl-defgeneric magit-gerrit-backend-set-private (backend change private options)
+  "Mark CHANGE as private when PRIVATE is non-nil, as public otherwise.
+BACKEND is the backend, OPTIONS a plist with the property :message."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'private)))
+
+(cl-defgeneric magit-gerrit-backend-set-commit-message (backend change message options)
+  "Set the commit MESSAGE of CHANGE with BACKEND, creating a patchset.
+OPTIONS is a plist with the property :notify."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'edit-message)))
+
+(cl-defgeneric magit-gerrit-backend-revert (backend change options)
+  "Create a change reverting CHANGE with BACKEND and return it.
+OPTIONS is a plist with the properties :message (the commit message
+of the revert) and :notify."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'revert)))
+
+(cl-defgeneric magit-gerrit-backend-cherry-pick (backend change revision branch options)
+  "Cherry-pick REVISION of CHANGE to BRANCH on the server with BACKEND.
+Return the created change.  OPTIONS is a plist with the property
+:message (the commit message of the cherry-pick)."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'cherry-pick)))
+
+(cl-defgeneric magit-gerrit-backend-suggest-accounts (backend query &optional change)
+  "Return the accounts matching QUERY, as strings, using BACKEND.
+When CHANGE is non-nil, suggest reviewers for it."
+  (:method (backend &rest _) (magit-gerrit--unsupported backend 'suggest-accounts)))
+
+(defvar-local magit-gerrit--backend nil
+  "The backend of the buffer, as (FINGERPRINT . BACKEND).
+See `magit-gerrit-current-backend'.")
+
+(defun magit-gerrit--backend-fingerprint ()
+  "Return the values the backend of the current buffer depends on."
+  (cons default-directory
+        (mapcar (lambda (var) (and (boundp var) (symbol-value var)))
+                magit-gerrit-backend-variables)))
+
+(defun magit-gerrit--make-backend (name remote-url explicit)
+  "Make the backend NAME for REMOTE-URL, return nil if it can't be used.
+EXPLICIT is non-nil when the backend was chosen explicitly."
+  (if-let* ((constructor (alist-get name magit-gerrit-backends)))
+      (funcall constructor remote-url explicit)
+    (when explicit
+      (user-error "Unknown Gerrit backend `%s', see `magit-gerrit-backend'" name))))
+
+(defun magit-gerrit--find-backend ()
+  "Return the backend for the current repository, see `magit-gerrit-backend'.
+In `auto' mode, the first backend matching the remote is used, or
+else the first one that can be used."
+  (let ((remote-url (magit-gerrit-get-remote-url)))
+    (if (memq magit-gerrit-backend '(nil auto))
+        (let ((backends (delq nil (mapcar (lambda (name) (magit-gerrit--make-backend name remote-url nil))
+                                          magit-gerrit-auto-backends))))
+          (or (seq-find (lambda (backend) (magit-gerrit-backend-matches-remote-p backend remote-url))
+                        backends)
+              (car backends)))
+      (magit-gerrit--make-backend magit-gerrit-backend remote-url t))))
+
+(defun magit-gerrit-current-backend (&optional noerror)
+  "Return the Gerrit backend of the current buffer.
+The backend is chosen with `magit-gerrit-backend', it is cached in the
+buffer.  When there is none, signal a `user-error', or return nil
+when NOERROR is non-nil."
+  (or (and (equal (car magit-gerrit--backend) (magit-gerrit--backend-fingerprint))
+           (cdr magit-gerrit--backend))
+      (when-let* ((backend (magit-gerrit--find-backend)))
+        ;; The constructor may have set variables, take them into account
+        (setq-local magit-gerrit--backend (cons (magit-gerrit--backend-fingerprint) backend))
+        backend)
+      (unless noerror
+        (user-error "No Gerrit backend for this repository, see `magit-gerrit-backend'"))))
+
+(defun magit-gerrit--supports-p (feature)
+  "Return non-nil when the backend of the current buffer supports FEATURE."
+  (when-let* ((backend (ignore-errors (magit-gerrit-current-backend t))))
+    (memq feature (magit-gerrit-backend-features backend))))
+
+(defun magit-gerrit--require (feature)
+  "Return the backend of the current buffer, check that it supports FEATURE."
+  (let ((backend (magit-gerrit-current-backend)))
+    (unless (memq feature (magit-gerrit-backend-features backend))
+      (magit-gerrit--unsupported backend feature))
+    backend))
+
+(defun magit-gerrit--inherited-values ()
+  "Return the values of `magit-gerrit-backend-variables' as an alist.
+The backend of the current buffer is included, so that the buffers
+showing Gerrit data share it."
+  (cons (cons 'magit-gerrit--backend magit-gerrit--backend)
+        (seq-keep (lambda (var) (when (boundp var) (cons var (symbol-value var))))
+                  magit-gerrit-backend-variables)))
+
+(defun magit-gerrit--inherit-values (values)
+  "Set the buffer-local VALUES, as returned by `magit-gerrit--inherited-values'."
+  (pcase-dolist (`(,var . ,value) values)
+    (set (make-local-variable var) value)))
+
+
+;;; Backend inputs
+
+(defun magit-gerrit--review-options (args &rest extra)
+  "Return the plist of options of the transient ARGS, plus EXTRA.
+These are the :message and :notify properties."
+  (append
+   (when-let* ((msg (transient-arg-value "--message=" args)))
+     (list :message msg))
+   (when-let* ((notify (transient-arg-value "--notify=" args)))
+     (list :notify notify))
+   extra))
+
+(defun magit-gerrit--reviewers-input (accounts state)
+  "Return a ReviewInput adding ACCOUNTS as reviewers in STATE.
+STATE is \"REVIEWER\" or \"CC\"."
+  `((reviewers . ,(vconcat (mapcar (lambda (account) `((reviewer . ,account) (state . ,state)))
+                                   accounts)))))
+
+(defun magit-gerrit--comment-input (comment)
+  "Return the CommentInput entity of COMMENT, a plist.
+See `magit-gerrit-backend-post-comments' for its properties."
+  (append
+   (when-let* ((line (plist-get comment :line))) `((line . ,line)))
+   (when (equal (plist-get comment :side) "PARENT") '((side . "PARENT")))
+   (when-let* ((id (plist-get comment :in-reply-to))) `((in_reply_to . ,id)))
+   `((message . ,(plist-get comment :message))
+     (unresolved . ,(if (plist-get comment :unresolved) t :json-false)))))
+
+(defun magit-gerrit--comments-input (comments)
+  "Return the \"comments\" map of a ReviewInput entity for COMMENTS.
+COMMENTS are plists, see `magit-gerrit-backend-post-comments'."
+  (let (map)
+    (dolist (comment comments)
+      (push (magit-gerrit--comment-input comment)
+            (alist-get (plist-get comment :file) map nil nil #'equal)))
+    (mapcar (lambda (entry) (cons (car entry) (vconcat (nreverse (cdr entry)))))
+            (nreverse map))))
+
+
+;;; Queries
 
 (defvar magit-gerrit--known-accounts (make-hash-table :test #'equal)
   "Accounts seen in query results, offered when reading reviewers.")
+
+(defun magit-gerrit--account-string (account)
+  "Return the string identifying ACCOUNT for Gerrit, or nil."
+  (or (alist-get 'email account) (alist-get 'username account)
+      (when-let* ((id (alist-get 'accountId account))) (format "%s" id))))
 
 (defun magit-gerrit--remember-accounts (change)
   "Remember the accounts (owner, reviewers, voters) involved in CHANGE."
   (dolist (account (append (list (alist-get 'owner change))
                            (alist-get 'allReviewers change)
+                           (alist-get 'ccs change)
                            (mapcar (lambda (a) (alist-get 'by a))
                                    (magit-gerrit--get change 'currentPatchSet 'approvals))))
     (when-let* ((id (or (alist-get 'email account) (alist-get 'username account))))
       (puthash id t magit-gerrit--known-accounts))))
 
-(defun magit-gerrit--query-args (query options)
-  "Return the arguments of \"gerrit query\" for QUERY and OPTIONS."
-  (list "--format=JSON" options query))
-
-(defun magit-gerrit--parse-query-output (output)
-  "Parse the OUTPUT of a Gerrit query, return the parsed change list."
-  (let ((changes (magit-gerrit--parse-json-lines output)))
+(defun magit-gerrit--query-changes (query &rest options)
+  "Run the Gerrit QUERY with OPTIONS, return the matching change list.
+QUERY is a string or a list of query terms, OPTIONS are keywords of
+`magit-gerrit-query-options' such as :current-patch-set."
+  (let ((changes (magit-gerrit-backend-query (magit-gerrit--require 'query) query options)))
     (mapc #'magit-gerrit--remember-accounts changes)
     changes))
 
-(defun magit-gerrit--query-changes (query &rest options)
-  "Run the Gerrit QUERY with OPTIONS, return the matching change list.
-QUERY is a string or a list of query terms, OPTIONS are additional
-options for \"gerrit query\" such as \"--current-patch-set\"."
-  (magit-gerrit--parse-query-output
-   (magit-gerrit--ssh-call "query" (magit-gerrit--query-args query options))))
+(defun magit-gerrit--get-change (number)
+  "Return the change NUMBER with all its details, or nil."
+  (when-let* ((change (magit-gerrit-backend-get-change (magit-gerrit--require 'query) number)))
+    (magit-gerrit--remember-accounts change)
+    change))
 
 (defun magit-gerrit--query-terms (&optional prj)
   "Return the query terms to list the reviews of project PRJ.
@@ -467,7 +787,7 @@ non-nil."
        magit-gerrit-extra-options)
      (list (or magit-gerrit-query-filters "status:open")))))
 
-(defconst magit-gerrit--reviews-query-options '("--current-patch-set" "--submit-records")
+(defconst magit-gerrit--reviews-query-options '(:current-patch-set :submit-records)
   "Options of the query listing the reviews.")
 
 (defun magit-gerrit--fetch-reviews ()
@@ -477,97 +797,100 @@ non-nil."
 
 (defvar magit-gerrit--async-cache (make-hash-table :test #'equal)
   "Reviews fetched asynchronously.
-Keys are (TOPLEVEL CREDENTIALS QUERY-TERMS), values are plists with
-the properties :time (of the last completed fetch), :changes, :error
-and :process (the running fetch).")
+Keys are (TOPLEVEL SERVER QUERY-TERMS), values are plists with the
+properties :time (of the last completed fetch), :changes, :error and
+:pending (non-nil while a fetch is running).")
 
 (defun magit-gerrit--async-refresh-status (toplevel)
-  "Refresh the status buffers of the repository TOPLEVEL."
-  (dolist (buffer (buffer-list))
-    (with-current-buffer buffer
-      (when (and (derived-mode-p 'magit-status-mode)
-                 (equal (magit-toplevel) toplevel))
-        (magit-refresh-buffer)))))
+  "Refresh the status buffers of the repository TOPLEVEL.
+Synchronous requests (such as those of the REST backend) process the
+events while waiting, so this can be called while a buffer is being
+refreshed: the refresh is then postponed."
+  (if (or (bound-and-true-p magit-insert-section--parent)
+          (bound-and-true-p magit--refreshing-buffer-p))
+      (run-at-time 0.1 nil #'magit-gerrit--async-refresh-status toplevel)
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (and (derived-mode-p 'magit-status-mode)
+                   (equal (magit-toplevel) toplevel))
+          (magit-refresh-buffer))))))
 
-(defun magit-gerrit--async-fetch (key terms)
-  "Fetch the reviews matching TERMS in the background, store them at KEY."
-  (let* ((toplevel (car key))
-         (ssh-args (apply #'magit-gerrit--command "query"
-                          (magit-gerrit--query-args terms magit-gerrit--reviews-query-options)))
-         (stdout (generate-new-buffer " *magit-gerrit-async*"))
-         (stderr (generate-new-buffer " *magit-gerrit-async-err*"))
-         (default-directory (if (file-remote-p default-directory)
-                                temporary-file-directory
-                              default-directory))
-         (process
-          (make-process
-           :name "magit-gerrit-reviews"
-           :buffer stdout
-           :stderr stderr
-           :command (cons magit-gerrit-ssh-program ssh-args)
-           :connection-type 'pipe
-           :coding 'utf-8
-           :noquery t
-           :sentinel
-           (lambda (process _event)
-             (unless (process-live-p process)
-               (let* ((exit-code (process-exit-status process))
-                      (err (with-current-buffer stderr (string-trim (buffer-string))))
-                      (entry (gethash key magit-gerrit--async-cache))
-                      (result (if (eq exit-code 0)
-                                  (condition-case e
-                                      (list :changes (magit-gerrit--parse-query-output
-                                                      (with-current-buffer stdout (buffer-string))))
-                                    (error (list :error (error-message-string e))))
-                                (list :changes (plist-get entry :changes)
-                                      :error (format "Gerrit command \"query\" failed: %s"
-                                                     (if (string-empty-p err)
-                                                         (format "exit code %s" exit-code)
-                                                       (car (split-string err "\n" t))))))))
-                 (magit-gerrit--log ssh-args exit-code err)
-                 (kill-buffer stdout)
-                 (kill-buffer stderr)
-                 (puthash key (append (list :time (current-time)) result)
-                          magit-gerrit--async-cache)
-                 (magit-gerrit--async-refresh-status toplevel)))))))
-    (puthash key (plist-put (copy-sequence (gethash key magit-gerrit--async-cache))
-                            :process process)
-             magit-gerrit--async-cache)))
+(defun magit-gerrit--async-fetch (backend key terms)
+  "Fetch the reviews matching TERMS with BACKEND in the background.
+Store them in `magit-gerrit--async-cache' at KEY."
+  (puthash key (plist-put (copy-sequence (gethash key magit-gerrit--async-cache)) :pending t)
+           magit-gerrit--async-cache)
+  (condition-case err
+      (magit-gerrit-backend-query-async
+       backend terms magit-gerrit--reviews-query-options
+       (lambda (changes error)
+         (let ((entry (gethash key magit-gerrit--async-cache)))
+           (mapc #'magit-gerrit--remember-accounts changes)
+           (puthash key (list :time (current-time)
+                              :changes (if error (plist-get entry :changes) changes)
+                              :error error)
+                    magit-gerrit--async-cache)
+           (magit-gerrit--async-refresh-status (car key)))))
+    (error
+     (puthash key (list :time (current-time) :error (error-message-string err))
+              magit-gerrit--async-cache))))
 
 (defun magit-gerrit--async-reviews ()
   "Return the cached reviews, fetching them in the background if needed.
-Return a plist with the :changes, :error and :process properties."
+Return a plist with the :changes, :error and :pending properties."
   (when-let* ((terms (magit-gerrit--query-terms)))
-    (let* ((key (list (magit-toplevel) magit-gerrit-ssh-creds terms))
+    (let* ((backend (magit-gerrit-current-backend))
+           (key (list (magit-toplevel) (magit-gerrit-backend-key backend) terms))
            (entry (gethash key magit-gerrit--async-cache))
            (time (plist-get entry :time)))
-      (unless (or (process-live-p (plist-get entry :process))
+      (unless (or (plist-get entry :pending)
                   (and time (< (float-time (time-since time)) magit-gerrit-async-min-interval)))
-        (magit-gerrit--async-fetch key terms))
+        (if (memq 'async (magit-gerrit-backend-features backend))
+            (magit-gerrit--async-fetch backend key terms)
+          (puthash key (condition-case err
+                           (list :time (current-time) :changes (magit-gerrit--fetch-reviews))
+                         (error (list :time (current-time) :changes (plist-get entry :changes)
+                                      :error (error-message-string err))))
+                   magit-gerrit--async-cache)))
       (gethash key magit-gerrit--async-cache))))
 
-(defun magit-gerrit--message-args (args)
-  "Return the \"gerrit review\" arguments from the transient ARGS.
-These are the message and the notification setting."
-  (append
-   (when-let* ((msg (transient-arg-value "--message=" args)))
-     (list "--message" msg))
-   (when-let* ((notify (transient-arg-value "--notify=" args)))
-     (list "--notify" notify))))
-
-(defun magit-gerrit--review (change &rest args)
-  "Run \"gerrit review\" on the current patchset of CHANGE with ARGS."
-  (magit-gerrit--ssh-call "review"
-                          "--project" (magit-gerrit-change-project change)
-                          args
-                          (magit-gerrit-change-revision change)))
+(defun magit-gerrit-reset-backend ()
+  "Forget the backend of the current buffer and the cached data.
+The backend is made again, from the current configuration, the next
+time it is needed."
+  (interactive)
+  (kill-local-variable 'magit-gerrit--backend)
+  (clrhash magit-gerrit--change-id-cache)
+  (clrhash magit-gerrit--async-cache)
+  (when (derived-mode-p 'magit-mode)
+    (magit-refresh)))
 
 
 ;;; Change data model
 
-;; Changes are the objects returned by "gerrit query --format=JSON", parsed
-;; as alists (see `magit-gerrit--parse-json-lines').  Their structure is
-;; documented in https://gerrit-review.googlesource.com/Documentation/json.html
+;; The backends return changes in the format of the objects returned by
+;; "gerrit query --format=JSON", parsed as alists (symbol keys, arrays
+;; as lists, null and false as nil, see `magit-gerrit--json-parse').
+;; Their structure is documented in
+;; https://gerrit-review.googlesource.com/Documentation/json.html
+;; Any attribute may be missing, the frontend shows what is available.
+;;
+;; Backends can provide more data with these optional attributes:
+;;
+;; - In the comments of the patchsets (patchSets[].comments): `id',
+;;   `inReplyTo' (the id of the comment replied to), `unresolved',
+;;   `updated' (seconds since the epoch), `side' ("PARENT" for the base
+;;   of the patchset) and `patchSet' (its number).
+;; - `drafts': the draft comments of the user, like the comments above,
+;;   with `patchSet' and `revision'.
+;; - `labelRanges': the values of the labels, an alist of
+;;   (LABEL MIN . MAX) with LABEL a string.
+;; - `permittedLabels': the votes the user can give, an alist of
+;;   (LABEL VALUE...).
+;; - `submitRequirements': a list of alists with `name' and `status'.
+;; - `ccs': the accounts in CC, `starred': non-nil when the user starred
+;;   the change.
+;; - Accounts may have an `accountId'.
 
 (defun magit-gerrit--get (obj &rest keys)
   "Return the value at the path KEYS in the nested alist OBJ."
@@ -657,6 +980,27 @@ Gerrit reports deletions as a negative number, this returns its
 absolute value."
   (abs (or (magit-gerrit--get change 'currentPatchSet 'sizeDeletions) 0)))
 
+(defun magit-gerrit-change-hashtags (change)
+  "Return the hashtags of CHANGE."
+  (magit-gerrit--get change 'hashtags))
+
+(defun magit-gerrit-change-private-p (change)
+  "Return non-nil when CHANGE is private."
+  (eq (magit-gerrit--get change 'private) t))
+
+(defun magit-gerrit-change-starred-p (change)
+  "Return non-nil when the user starred CHANGE (if the backend knows it)."
+  (eq (magit-gerrit--get change 'starred) t))
+
+(defun magit-gerrit-change-drafts (change)
+  "Return the draft comments of the user on CHANGE."
+  (magit-gerrit--get change 'drafts))
+
+(defun magit-gerrit-change-find-patchset (change revision)
+  "Return the patchset of CHANGE whose commit is REVISION, or nil."
+  (seq-find (lambda (ps) (equal (alist-get 'revision ps) revision))
+            (cons (magit-gerrit-change-patchset change) (alist-get 'patchSets change))))
+
 (defvar-local magit-gerrit-buffer-change-number nil
   "Number of the change shown in a `magit-gerrit-change-mode' buffer.")
 
@@ -673,6 +1017,15 @@ In a change buffer, this is the change shown in the buffer."
 (defun magit-gerrit-patchset-at-point ()
   "Return the patchset at point in a change buffer, or nil."
   (magit-section-value-if 'gerrit-patchset))
+
+(defun magit-gerrit-comment-at-point ()
+  "Return the inline comment at point in a change buffer, or nil.
+The comment has a `patchset' attribute, the patchset it is on."
+  (magit-section-value-if 'gerrit-comment))
+
+(defun magit-gerrit-draft-at-point ()
+  "Return the draft comment at point in a change buffer, or nil."
+  (magit-section-value-if 'gerrit-draft))
 
 (defun magit-gerrit--change-at-point-or-error ()
   "Return the Gerrit change at point, signal an error if there is none."
@@ -697,25 +1050,29 @@ In a change buffer, this is the change shown in the buffer."
      remote)))
 
 (defun magit-gerrit-get-project ()
-  "Get the Gerrit project name for the current repo."
+  "Get the Gerrit project name for the current repo.
+For HTTP(S) remotes, the \"/a/\" prefix of authenticated URLs is
+removed, so is the path of `magit-gerrit-web-url' when Gerrit is not
+at the root of its host."
   (when-let* ((url (magit-gerrit-get-remote-url))
               (url (url-generic-parse-url url))
               (prj (url-filename url)))
+    (when (member (url-type url) '("http" "https"))
+      (when-let* ((base (and magit-gerrit-web-url
+                             (url-filename (url-generic-parse-url magit-gerrit-web-url))))
+                  (base (string-trim-right base "/"))
+                  ((not (string-empty-p base)))
+                  ((string-prefix-p (concat base "/") prj)))
+        (setq prj (substring prj (length base))))
+      (setq prj (string-remove-prefix "/a/" prj)))
     (string-trim-right (string-trim-left prj "/") "\\.git")))
 
-(defun magit-gerrit-detect-ssh-creds (remote-url)
-  "Derive `magit-gerrit-ssh-creds' from REMOTE-URL.
-Assumes REMOTE-URL is a Gerrit repo if scheme is SSH and port is
-`magit-gerrit-port' or when `magit-gerrit-force-enable' is non-nil."
-  (prog1 (or magit-gerrit-ssh-creds
-             (when-let* ((url (url-generic-parse-url remote-url))
-                         (user (url-user url))
-                         (host (url-host url))
-                         ((and (string= "ssh" (url-type url))
-                               (or magit-gerrit-force-enable (eq magit-gerrit-port (url-port url))))))
-               (setq-local magit-gerrit-ssh-creds (format "%s@%s" user host))))
-    (let ((inhibit-message t))
-      (message "Detected magit-gerrit-ssh-creds=%s" magit-gerrit-ssh-creds))))
+(defun magit-gerrit--remote-host (remote-url)
+  "Return the host of REMOTE-URL, also for scp-like URLs (user@host:path)."
+  (when remote-url
+    (or (url-host (url-generic-parse-url remote-url))
+        (and (string-match "\\`\\(?:[^@/]+@\\)?\\([^:/]+\\):" remote-url)
+             (match-string 1 remote-url)))))
 
 
 ;;; Change-Id
@@ -755,7 +1112,7 @@ INVALIDATE-CACHE is non-nil, don't use cached values."
                             (concat "(" (mapconcat (lambda (id) (concat "change:" id))
                                                    missing " OR ")
                                     ")"))
-                      "--current-patch-set"))
+                      :current-patch-set))
             (now (current-time)))
         (dolist (id missing)
           (puthash id
@@ -929,20 +1286,24 @@ the face of the subject."
                        'font-lock-face 'diff-removed))
    (when-let* ((time (magit-gerrit-change-last-updated change)))
      (magit-gerrit-format-short-timestring (time-to-seconds (time-since time))))
-   (magit-gerrit-wash-approvals-oneline (magit-gerrit-change-approvals change))
+   (magit-gerrit-wash-approvals-oneline (magit-gerrit-change-approvals change) change)
    (if (magit-gerrit-change-wip-p change) 'magit-dimmed 'magit-filename)))
 
-(defun magit-gerrit--label-range (label)
-  "Return the range of the values of LABEL, as (MIN . MAX)."
-  (or (cdr (assoc label magit-gerrit-label-values))
+(defun magit-gerrit--label-range (label &optional change)
+  "Return the range of the values of LABEL, as (MIN . MAX).
+The range given by the backend for CHANGE takes precedence over
+`magit-gerrit-label-values'."
+  (or (cdr (assoc label (alist-get 'labelRanges change)))
+      (cdr (assoc label magit-gerrit-label-values))
       magit-gerrit-default-label-values))
 
-(defun magit-gerrit-trans-score (type value-list)
-  "Format the votes VALUE-LIST of label TYPE as a single character."
+(defun magit-gerrit-trans-score (type value-list &optional change)
+  "Format the votes VALUE-LIST of label TYPE as a single character.
+CHANGE is the change voted on, see `magit-gerrit--label-range'."
   (if (and value-list (length> value-list 0))
       (let* ((min-v (apply #'min value-list))
              (max-v (apply #'max value-list))
-             (range (magit-gerrit--label-range type))
+             (range (magit-gerrit--label-range type change))
              (t-min-v (car range))
              (t-max-v (cdr range)))
         (cond
@@ -952,8 +1313,9 @@ the face of the subject."
          (t (propertize (format "%d" min-v) 'font-lock-face 'magit-signature-bad))))
     " "))
 
-(defun magit-gerrit-wash-approvals-oneline (approvals)
-  "Format APPROVALS on one line, one column per review label."
+(defun magit-gerrit-wash-approvals-oneline (approvals &optional change)
+  "Format APPROVALS on one line, one column per review label.
+CHANGE is the change voted on, see `magit-gerrit--label-range'."
   (let* (type-values)
     (seq-doseq (approval approvals)
       (let ((type (alist-get 'type approval))
@@ -963,7 +1325,7 @@ the face of the subject."
      (lambda (elem)
        (let* ((long (car elem))
               (score (magit-gerrit-trans-score
-                      long (alist-get long type-values nil nil #'string-equal))))
+                      long (alist-get long type-values nil nil #'string-equal) change)))
          (format "%2s" score)))
      magit-gerrit-review-labels
      " ")))
@@ -994,11 +1356,13 @@ Errors are displayed in the section instead of aborting the refresh."
                 (if magit-gerrit-query-all-projects ", all projects" "")))
       (insert (magit-gerrit-pretty-print-review-header))
       (if magit-gerrit-async-reviews
-          (let ((entry (magit-gerrit--async-reviews)))
+          (let ((entry (condition-case err
+                           (magit-gerrit--async-reviews)
+                         (error (list :error (error-message-string err))))))
             (mapc #'magit-gerrit--insert-review (plist-get entry :changes))
             (when-let* ((err (plist-get entry :error)))
               (insert (propertize (format "%s\n" err) 'font-lock-face 'error)))
-            (when (and (not (plist-get entry :time)) (process-live-p (plist-get entry :process)))
+            (when (and (not (plist-get entry :time)) (plist-get entry :pending))
               (insert (propertize "Loading...\n" 'font-lock-face 'shadow))))
         (condition-case err
             (mapc #'magit-gerrit--insert-review (magit-gerrit--fetch-reviews))
@@ -1240,30 +1604,73 @@ HEAD commit instead of at the branch."
   (magit-gerrit--copy (or (magit-gerrit-get-ref select-number)
                           (user-error "No Gerrit change at point"))))
 
-(defun magit-gerrit--read-account-list (prompt)
-  "Read a non-empty list of accounts with PROMPT."
-  (or (completing-read-multiple prompt (magit-gerrit--account-candidates)
+(defcustom magit-gerrit-suggest-accounts-min-length 2
+  "Minimum length of the input before asking the server for accounts.
+The REST backend suggests the accounts matching the input when
+reading reviewers and CCs.  Nil disables the suggestions."
+  :group 'magit-gerrit
+  :type '(choice (const :tag "Never suggest" nil) integer))
+
+(defun magit-gerrit--account-table (&optional change)
+  "Return the completion table of accounts, for reviewers of CHANGE.
+It has the accounts of `magit-gerrit--account-candidates' and, when
+the backend can suggest accounts, the ones matching the input."
+  (let ((static (magit-gerrit--account-candidates))
+        (backend (magit-gerrit-current-backend t)))
+    (if (and magit-gerrit-suggest-accounts-min-length
+             (magit-gerrit--supports-p 'suggest-accounts))
+        (completion-table-with-cache
+         (lambda (input)
+           (seq-uniq
+            (append (when (>= (length input) magit-gerrit-suggest-accounts-min-length)
+                      (ignore-errors (magit-gerrit-backend-suggest-accounts backend input change)))
+                    static))))
+      static)))
+
+(defun magit-gerrit--read-account-list (prompt &optional change)
+  "Read a non-empty list of accounts with PROMPT, for CHANGE."
+  (or (completing-read-multiple prompt (magit-gerrit--account-table change)
                                 nil nil nil 'magit-gerrit-reviewer-history)
       (user-error "No account")))
 
 (defun magit-gerrit--change-reviewers (change)
-  "Return the reviewers of CHANGE, querying them if needed."
-  (or (alist-get 'allReviewers change)
-      (alist-get 'allReviewers
-                 (car (magit-gerrit--query-changes
-                       (format "change:%s" (magit-gerrit-change-number change))
-                       "--all-reviewers")))))
+  "Return the reviewers and CCs of CHANGE, querying them if needed."
+  (or (append (alist-get 'allReviewers change) (alist-get 'ccs change))
+      (let ((change (car (magit-gerrit--query-changes
+                          (format "change:%s" (magit-gerrit-change-number change))
+                          :reviewers))))
+        (append (alist-get 'allReviewers change) (alist-get 'ccs change)))))
+
+(defun magit-gerrit--refresh-buffer (buffer)
+  "Refresh BUFFER, a Magit buffer, if it is live."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (magit-refresh))))
+
+(defun magit-gerrit--refresh-change-buffers (number)
+  "Refresh the other buffers showing the change NUMBER."
+  (dolist (buffer (buffer-list))
+    (unless (eq buffer (current-buffer))
+      (with-current-buffer buffer
+        (when (and (derived-mode-p 'magit-gerrit-change-mode)
+                   (equal magit-gerrit-buffer-change-number number))
+          (magit-refresh))))))
+
+(defmacro magit-gerrit--with-change (feature bindings &rest body)
+  "Run BODY on the change at point with the backend supporting FEATURE.
+BINDINGS is a list of two symbols, bound to the change and to the
+backend.  The current buffer is refreshed after BODY."
+  (declare (indent 2) (debug (symbolp (symbolp symbolp) body)))
+  `(let ((,(car bindings) (magit-gerrit--change-at-point-or-error))
+         (,(cadr bindings) (magit-gerrit--require ',feature)))
+     (prog1 (progn ,@body)
+       (magit-refresh))))
 
 (defun magit-gerrit-add-reviewer (accounts)
   "Add ACCOUNTS as reviewers to the change at point."
-  (interactive (list (magit-gerrit--read-account-list "Add reviewers: ")))
-  (let ((change (magit-gerrit--change-at-point-or-error)))
-    (magit-gerrit--ssh-call
-     "set-reviewers"
-     "--project" (magit-gerrit-change-project change)
-     (mapcar (lambda (account) (list "--add" account)) accounts)
-     (magit-gerrit-change-id change))
-    (magit-refresh)))
+  (interactive (list (magit-gerrit--read-account-list "Add reviewers: " (magit-gerrit-change-at-point))))
+  (magit-gerrit--with-change reviewers (change backend)
+    (magit-gerrit-backend-add-reviewers backend change accounts)))
 
 (defun magit-gerrit-remove-reviewer (accounts)
   "Remove ACCOUNTS from the reviewers of the change at point."
@@ -1271,91 +1678,73 @@ HEAD commit instead of at the branch."
    (let ((change (magit-gerrit--change-at-point-or-error)))
      (list (or (completing-read-multiple
                 "Remove reviewers: "
-                (seq-keep (lambda (account)
-                            (or (alist-get 'email account) (alist-get 'username account)))
-                          (magit-gerrit--change-reviewers change)))
+                (seq-keep #'magit-gerrit--account-string (magit-gerrit--change-reviewers change)))
                (user-error "No account")))))
-  (let ((change (magit-gerrit--change-at-point-or-error)))
-    (magit-gerrit--ssh-call
-     "set-reviewers"
-     "--project" (magit-gerrit-change-project change)
-     (mapcar (lambda (account) (list "--remove" account)) accounts)
-     (magit-gerrit-change-id change))
-    (magit-refresh)))
+  (magit-gerrit--with-change reviewers (change backend)
+    (magit-gerrit-backend-remove-reviewers backend change accounts)))
 
 (defun magit-gerrit-add-cc (accounts)
   "Add ACCOUNTS in CC of the change at point."
-  (interactive (list (magit-gerrit--read-account-list "Add CC: ")))
-  (magit-gerrit--review-json
-   (magit-gerrit--change-at-point-or-error)
-   `((reviewers . ,(vconcat (mapcar (lambda (account) `((reviewer . ,account) (state . "CC")))
-                                    accounts)))))
-  (magit-refresh))
+  (interactive (list (magit-gerrit--read-account-list "Add CC: " (magit-gerrit-change-at-point))))
+  (magit-gerrit--with-change cc (change backend)
+    (magit-gerrit-backend-add-reviewers backend change accounts t)))
 
 (defun magit-gerrit-mark-wip (args)
   "Mark the change at point as work in progress, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review-json
-   (magit-gerrit--change-at-point-or-error)
-   `((work_in_progress . t)
-     ,@(when-let* ((msg (transient-arg-value "--message=" args))) `((message . ,msg)))))
-  (magit-refresh))
+  (magit-gerrit--with-change wip (change backend)
+    (magit-gerrit-backend-set-wip backend change t (magit-gerrit--review-options args))))
 
 (defun magit-gerrit-mark-ready (args)
   "Mark the change at point as ready for review, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review-json
-   (magit-gerrit--change-at-point-or-error)
-   `((ready . t)
-     ,@(when-let* ((msg (transient-arg-value "--message=" args))) `((message . ,msg)))))
-  (magit-refresh))
+  (magit-gerrit--with-change wip (change backend)
+    (magit-gerrit-backend-set-wip backend change nil (magit-gerrit--review-options args))))
 
 (defun magit-gerrit-set-topic (topic)
   "Set the TOPIC of the change at point (an empty topic to remove it)."
   (interactive
    (let ((change (magit-gerrit--change-at-point-or-error)))
      (list (read-string "Topic (empty to remove): " (magit-gerrit-change-topic change)))))
-  (let ((change (magit-gerrit--change-at-point-or-error)))
-    (magit-gerrit--ssh-call
-     "set-topic"
-     (format "%s~%s~%s" (magit-gerrit-change-project change)
-             (magit-gerrit-change-branch change) (magit-gerrit-change-id change))
-     (unless (string-empty-p (string-trim topic))
-       (list "--topic" (string-trim topic))))
-    (magit-refresh)))
+  (magit-gerrit--with-change topic (change backend)
+    (let ((topic (string-trim topic)))
+      (magit-gerrit-backend-set-topic backend change (unless (string-empty-p topic) topic)))))
 
-(defun magit-gerrit-rebase-review ()
-  "Rebase the change at point on Gerrit."
-  (interactive)
-  (magit-gerrit--review (magit-gerrit--change-at-point-or-error) "--rebase")
-  (magit-refresh))
+(defun magit-gerrit-rebase-review (&optional args)
+  "Rebase the change at point on Gerrit, using transient ARGS."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--with-change rebase (change backend)
+    (magit-gerrit-backend-rebase backend change (magit-gerrit--review-options args))))
 
 (defun magit-gerrit-move-review (branch args)
   "Move the change at point to BRANCH, using transient ARGS."
   (interactive (list (magit-gerrit--read-target-branch "Move to branch: ")
                      (magit-gerrit-arguments)))
-  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
-                        "--move" branch (magit-gerrit--message-args args))
-  (magit-refresh))
+  (magit-gerrit--with-change move (change backend)
+    (magit-gerrit-backend-move backend change branch (magit-gerrit--review-options args))))
 
 (defun magit-gerrit-arguments ()
   "Return the arguments of the `magit-gerrit-dispatch' transient."
   (transient-args 'magit-gerrit-dispatch))
 
-(defun magit-gerrit--label-votes (label)
-  "Return the possible votes for LABEL, as \"LABEL=VALUE\" strings."
-  (let ((range (magit-gerrit--label-range label)))
+(defun magit-gerrit--label-votes (label &optional change)
+  "Return the possible votes for LABEL, as \"LABEL=VALUE\" strings.
+When the backend tells which votes the user can give on CHANGE, only
+these are returned."
+  (let ((values (or (cdr (assoc label (alist-get 'permittedLabels change)))
+                    (let ((range (magit-gerrit--label-range label change)))
+                      (number-sequence (cdr range) (car range) -1)))))
     (mapcar (lambda (value)
               (format "%s=%s" label (if (> value 0) (format "+%d" value) value)))
-            (number-sequence (cdr range) (car range) -1))))
+            (sort (copy-sequence values) #'>))))
 
 (defun magit-gerrit--read-votes (change &optional label)
   "Read votes on CHANGE, as a list of \"LABEL=VALUE\" strings.
 When LABEL is non-nil, read a single vote for this label."
   (if label
-      (list (completing-read "Vote: " (magit-gerrit--label-votes label) nil t))
+      (list (completing-read "Vote: " (magit-gerrit--label-votes label change) nil t))
     (completing-read-multiple "Votes (LABEL=VALUE, comma separated): "
-                              (mapcan #'magit-gerrit--label-votes
+                              (mapcan (lambda (label) (magit-gerrit--label-votes label change))
                                       (magit-gerrit--change-labels change))
                               nil t)))
 
@@ -1369,13 +1758,12 @@ submit the change after voting."
                  (list (magit-gerrit--read-votes change) (magit-gerrit-arguments))))
   (unless votes
     (user-error "No vote"))
-  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
-                        (mapcar (lambda (vote) (list "--label" vote)) votes)
-                        (magit-gerrit--message-args args)
-                        (when (member "--submit" args) "--submit"))
-  (when (member "--submit" args)
-    (magit-fetch-all-no-prune))
-  (magit-refresh))
+  (let ((submit (and (member "--submit" args) t)))
+    (magit-gerrit--with-change vote (change backend)
+      (magit-gerrit-backend-vote backend change votes
+                                 (magit-gerrit--review-options args :submit submit))
+      (when submit
+        (magit-fetch-all-no-prune)))))
 
 (defun magit-gerrit-code-review (args)
   "Vote on the Code-Review label of the change at point, using transient ARGS."
@@ -1394,41 +1782,428 @@ submit the change after voting."
 (defun magit-gerrit-submit-review (args)
   "Submit a Gerrit code review, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
-                        "--submit" (magit-gerrit--message-args args))
-  (magit-fetch-all-no-prune)
-  (magit-refresh))
+  (magit-gerrit--with-change submit (change backend)
+    (magit-gerrit-backend-submit backend change (magit-gerrit--review-options args))
+    (magit-fetch-all-no-prune)))
 
 (defun magit-gerrit-abandon-review (args)
   "Abandon the review at point, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
-                        "--abandon" (magit-gerrit--message-args args))
-  (magit-refresh))
+  (magit-gerrit--with-change abandon (change backend)
+    (magit-gerrit-backend-abandon backend change (magit-gerrit--review-options args))))
 
 (defun magit-gerrit-restore-review (args)
   "Restore the abandoned review at point, using transient ARGS."
   (interactive (list (magit-gerrit-arguments)))
-  (magit-gerrit--review (magit-gerrit--change-at-point-or-error)
-                        "--restore" (magit-gerrit--message-args args))
+  (magit-gerrit--with-change restore (change backend)
+    (magit-gerrit-backend-restore backend change (magit-gerrit--review-options args))))
+
+
+;;; Messages
+
+(defvar-local magit-gerrit--message-callback nil
+  "Function called with the text of a `magit-gerrit-message-mode' buffer.")
+
+(defvar-local magit-gerrit--message-start nil
+  "Marker of the start of the text in a `magit-gerrit-message-mode' buffer.")
+
+(defvar-keymap magit-gerrit-message-mode-map
+  :doc "Keymap of `magit-gerrit-message-mode'."
+  "C-c C-c" #'magit-gerrit-message-send
+  "C-c C-k" #'magit-gerrit-message-cancel)
+
+(define-derived-mode magit-gerrit-message-mode text-mode "Gerrit-Message"
+  "Mode for editing a Gerrit comment or message.
+
+\\<magit-gerrit-message-mode-map>\
+Type \\[magit-gerrit-message-send] to send the text, \
+\\[magit-gerrit-message-cancel] to cancel.
+
+\\{magit-gerrit-message-mode-map}"
+  :interactive nil
+  :group 'magit-gerrit)
+
+(defun magit-gerrit-read-message-in-buffer (prompt context initial callback)
+  "Edit a message in a `magit-gerrit-message-mode' buffer.
+PROMPT and CONTEXT are shown above the message, INITIAL is its initial
+text.  CALLBACK is called with the text when it is sent."
+  (let ((buffer (generate-new-buffer "*magit-gerrit-message*"))
+        (dir default-directory))
+    (with-current-buffer buffer
+      (magit-gerrit-message-mode)
+      (setq default-directory dir)
+      (insert (propertize
+               (concat (when context
+                         (concat (string-trim-right context) "\n\n"))
+                       (substitute-command-keys
+                        (format "%s (\\[magit-gerrit-message-send] to send, \\[magit-gerrit-message-cancel] to cancel):\n"
+                                prompt)))
+               'read-only t 'front-sticky t 'rear-nonsticky t
+               'font-lock-face 'font-lock-comment-face 'face 'font-lock-comment-face))
+      (setq magit-gerrit--message-start (point-marker))
+      (when initial (insert initial))
+      (setq magit-gerrit--message-callback callback)
+      (set-buffer-modified-p nil))
+    (pop-to-buffer buffer)))
+
+(defun magit-gerrit-read-message-in-minibuffer (prompt _context initial callback)
+  "Read a message with PROMPT and INITIAL text in the minibuffer.
+CALLBACK is called with the message."
+  (funcall callback (read-string (concat prompt ": ") initial)))
+
+(defun magit-gerrit-message-send ()
+  "Send the message of the current `magit-gerrit-message-mode' buffer."
+  (interactive nil magit-gerrit-message-mode)
+  (let ((message (string-trim (buffer-substring-no-properties magit-gerrit--message-start
+                                                              (point-max))))
+        (callback magit-gerrit--message-callback))
+    (when (string-empty-p message)
+      (user-error "Empty message, type %s to cancel"
+                  (substitute-command-keys "\\[magit-gerrit-message-cancel]")))
+    (quit-window t)
+    (funcall callback message)))
+
+(defun magit-gerrit-message-cancel ()
+  "Cancel the message of the current `magit-gerrit-message-mode' buffer."
+  (interactive nil magit-gerrit-message-mode)
+  (quit-window t)
+  (message "Cancelled"))
+
+(defun magit-gerrit--read-message (prompt context initial callback)
+  "Read a message with PROMPT, CONTEXT and INITIAL text, then call CALLBACK.
+The message is read by `magit-gerrit-read-message-function'.
+CALLBACK is called with the message in the current buffer, which is
+refreshed afterwards."
+  (let ((buffer (current-buffer)))
+    (funcall magit-gerrit-read-message-function prompt context initial
+             (lambda (message)
+               (with-current-buffer (if (buffer-live-p buffer) buffer (current-buffer))
+                 (funcall callback message)
+                 (when (derived-mode-p 'magit-mode)
+                   (magit-refresh)))))))
+
+
+;;; Inline comments
+
+(defvar-local magit-gerrit--diff-change nil
+  "The change of the patchset shown in a diff buffer, as (REVISION . CHANGE).")
+
+(defun magit-gerrit--diff-revision ()
+  "Return the commit shown in the current diff or revision buffer, or nil.
+For a range, this is the end of the range."
+  (let ((rev (cond ((derived-mode-p 'magit-revision-mode)
+                    (bound-and-true-p magit-buffer-revision))
+                   ((derived-mode-p 'magit-diff-mode)
+                    (when-let* ((range (seq-some (lambda (var) (and (boundp var) (symbol-value var)))
+                                                 '(magit-buffer-diff-range magit-buffer-range)))
+                                ((string-match "\\.\\.\\.?\\(.+\\)\\'" range)))
+                      (match-string 1 range))))))
+    (and rev (magit-rev-parse rev))))
+
+(defun magit-gerrit--hunk-position (hunk)
+  "Return the position of point in the HUNK section, as (LINE . SIDE).
+LINE is the line number of the line at point in the new version of the
+file, SIDE is \"REVISION\"; for a removed line, LINE is in the old
+version and SIDE is \"PARENT\"."
+  (save-excursion
+    (let ((target (line-beginning-position))
+          old new)
+      (goto-char (oref hunk start))
+      (unless (looking-at "^@@ -\\([0-9]+\\)\\(?:,[0-9]+\\)? \\+\\([0-9]+\\)")
+        (user-error "Cannot comment on this hunk"))
+      (setq old (string-to-number (match-string 1))
+            new (string-to-number (match-string 2)))
+      (forward-line 1)
+      (while (< (point) target)
+        (pcase (char-after)
+          (?+ (cl-incf new))
+          (?- (cl-incf old))
+          (?\s (cl-incf old) (cl-incf new)))
+        (forward-line 1))
+      (if (and (> target (oref hunk start)) (eq (char-after) ?-))
+          (cons old "PARENT")
+        (cons new "REVISION")))))
+
+(defun magit-gerrit--diff-position ()
+  "Return the position at point in a diff buffer as (FILE LINE SIDE), or nil.
+LINE is nil on the heading of a file.  See `magit-gerrit--hunk-position'."
+  (when-let* ((section (magit-current-section)))
+    (pcase (oref section type)
+      ('file (list (oref section value) nil "REVISION"))
+      ('hunk (let ((pos (magit-gerrit--hunk-position section)))
+               (list (oref (oref section parent) value) (car pos) (cdr pos)))))))
+
+(defun magit-gerrit--read-file (patchset)
+  "Read the path of a file of PATCHSET."
+  (let ((files (seq-remove (lambda (file) (string-prefix-p "/" file))
+                           (mapcar (lambda (f) (alist-get 'file f))
+                                   (alist-get 'files patchset)))))
+    (completing-read "File: " files nil (and files t))))
+
+(defun magit-gerrit--read-line ()
+  "Read a line number, nil for a comment on the whole file."
+  (let ((line (string-trim (read-string "Line (empty for the whole file): "))))
+    (unless (string-empty-p line)
+      (or (and (string-match-p "\\`[0-9]+\\'" line) (string-to-number line))
+          (user-error "Invalid line number: %s" line)))))
+
+(defun magit-gerrit--comment-target ()
+  "Return the target of a new inline comment at point.
+The target is a plist with the properties :change, :revision, :file,
+:line and :side.  In a diff or revision buffer, this is the line at
+point; in a change buffer, the file or the comment at point, the line
+being read; elsewhere, the change at point, the file and line being
+read."
+  (cond
+   ((derived-mode-p 'magit-diff-mode 'magit-revision-mode)
+    (let* ((position (or (magit-gerrit--diff-position) (user-error "No file at point")))
+           (revision (or (magit-gerrit--diff-revision) (user-error "No commit in this buffer")))
+           (change (if (equal (car magit-gerrit--diff-change) revision)
+                       (cdr magit-gerrit--diff-change)
+                     (magit-gerrit--read-commit-change "Change" revision))))
+      (list :change change :revision revision
+            :file (nth 0 position) :line (nth 1 position) :side (nth 2 position))))
+   ((when-let* ((comment (or (magit-gerrit-comment-at-point) (magit-gerrit-draft-at-point))))
+      (list :change (magit-gerrit--change-at-point-or-error)
+            :revision (alist-get 'revision (alist-get 'patchset comment))
+            :file (alist-get 'file comment)
+            :line (alist-get 'line comment)
+            :side (or (alist-get 'side comment) "REVISION"))))
+   (t
+    (let* ((change (magit-gerrit--change-at-point-or-error))
+           (file-at-point (magit-section-value-if 'gerrit-file))
+           (patchset (or (cdr file-at-point) (magit-gerrit-patchset-at-point)
+                         (magit-gerrit-change-patchset change)))
+           (file (or (car file-at-point) (magit-gerrit--read-file patchset))))
+      (list :change change :revision (alist-get 'revision patchset)
+            :file file :line (magit-gerrit--read-line) :side "REVISION")))))
+
+(defun magit-gerrit--comment-unresolved (args default)
+  "Return whether a comment is unresolved according to the transient ARGS.
+Return DEFAULT when ARGS have neither \"--unresolved\" nor
+\"--resolved\"."
+  (cond ((member "--unresolved" args) t)
+        ((member "--resolved" args) nil)
+        (t default)))
+
+(defun magit-gerrit--post-comment (change revision comment args)
+  "Post COMMENT on REVISION of CHANGE, using the transient ARGS.
+COMMENT is a plist, see `magit-gerrit-backend-post-comments'.  With
+the \"--draft\" argument, it is saved as a draft."
+  (let* ((draft (and (member "--draft" args) t))
+         (backend (magit-gerrit--require (if draft 'drafts 'comment))))
+    (magit-gerrit-backend-post-comments
+     backend change revision (list comment)
+     (if draft '(:draft t) (magit-gerrit--review-options args)))
+    (magit-gerrit--refresh-change-buffers (magit-gerrit-change-number change))
+    (message (if draft "Draft saved" "Comment posted"))))
+
+(defun magit-gerrit--format-location (file line)
+  "Format the location of a comment on FILE at LINE."
+  (concat (pcase file
+            ("/COMMIT_MSG" "Commit message")
+            ("/PATCHSET_LEVEL" "Patchset")
+            ("/MERGE_LIST" "Merge list")
+            (_ file))
+          (if line (format ":%s" line) "")))
+
+(defun magit-gerrit-comment (args)
+  "Add an inline comment, using transient ARGS.
+In a diff of a patchset (see `magit-gerrit-show-patchset-file'), or
+in a revision buffer, comment on the line at point (on its old version
+for a removed line).  In a change buffer, comment on the file or on
+the line of the comment at point.  With the \"--draft\" argument, save
+the comment as a draft (if the backend supports drafts).  New comments
+are unresolved, unless the \"--resolved\" argument is given."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--require (if (member "--draft" args) 'drafts 'comment))
+  (let* ((target (magit-gerrit--comment-target))
+         (change (plist-get target :change)))
+    (magit-gerrit--read-message
+     (format "Comment on %s" (magit-gerrit--format-location (plist-get target :file)
+                                                            (plist-get target :line)))
+     (format "Change %s: %s" (magit-gerrit-change-number change) (magit-gerrit-change-subject change))
+     nil
+     (lambda (message)
+       (magit-gerrit--post-comment
+        change (plist-get target :revision)
+        (list :file (plist-get target :file) :line (plist-get target :line)
+              :side (plist-get target :side) :message message
+              :unresolved (magit-gerrit--comment-unresolved args t))
+        args)))))
+
+(defun magit-gerrit--comment-at-point-or-error ()
+  "Return the published comment at point, check that it can be replied to."
+  (let ((comment (or (magit-gerrit-comment-at-point) (user-error "No comment at point"))))
+    (magit-gerrit--require 'reply)
+    (unless (alist-get 'id comment)
+      (user-error "This comment has no identifier, it can't be replied to"))
+    comment))
+
+(defun magit-gerrit--reply (comment message unresolved args)
+  "Reply MESSAGE to COMMENT, UNRESOLVED or not, using the transient ARGS."
+  (magit-gerrit--post-comment
+   (magit-gerrit--change-at-point-or-error)
+   (alist-get 'revision (alist-get 'patchset comment))
+   (list :file (alist-get 'file comment) :line (alist-get 'line comment)
+         :side (alist-get 'side comment) :in-reply-to (alist-get 'id comment)
+         :message message :unresolved unresolved)
+   args))
+
+(defun magit-gerrit-reply (args)
+  "Reply to the comment at point, using transient ARGS.
+The thread stays unresolved if the comment is, unless the
+\"--resolved\" or \"--unresolved\" argument is given.  With the
+\"--draft\" argument, save the reply as a draft."
+  (interactive (list (magit-gerrit-arguments)))
+  (when (member "--draft" args)
+    (magit-gerrit--require 'drafts))
+  (let ((comment (magit-gerrit--comment-at-point-or-error)))
+    (magit-gerrit--read-message
+     (format "Reply to %s" (magit-gerrit--format-account (alist-get 'reviewer comment)))
+     (concat (magit-gerrit--format-location (alist-get 'file comment) (alist-get 'line comment))
+             "\n"
+             (replace-regexp-in-string "^" "> " (or (alist-get 'message comment) "")))
+     nil
+     (lambda (message)
+       (magit-gerrit--reply comment message
+                            (magit-gerrit--comment-unresolved
+                             args (eq (alist-get 'unresolved comment) t))
+                            args)))))
+
+(defun magit-gerrit-reply-done (args)
+  "Reply \"Done\" to the comment at point and resolve it, using ARGS.
+ARGS are the transient arguments."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--reply (magit-gerrit--comment-at-point-or-error) "Done" nil args)
   (magit-refresh))
+
+(defun magit-gerrit-reply-ack (args)
+  "Reply \"Ack\" to the comment at point and resolve it, using ARGS.
+ARGS are the transient arguments."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--reply (magit-gerrit--comment-at-point-or-error) "Ack" nil args)
+  (magit-refresh))
+
+(defun magit-gerrit--draft-at-point-or-error ()
+  "Return the draft comment at point, check that drafts are supported."
+  (prog1 (or (magit-gerrit-draft-at-point) (user-error "No draft comment at point"))
+    (magit-gerrit--require 'drafts)))
+
+(defun magit-gerrit-edit-draft (draft)
+  "Edit the text of the DRAFT comment at point."
+  (interactive (list (magit-gerrit--draft-at-point-or-error)))
+  (let ((change (magit-gerrit--change-at-point-or-error)))
+    (magit-gerrit--read-message
+     (format "Draft on %s" (magit-gerrit--format-location (alist-get 'file draft) (alist-get 'line draft)))
+     nil (alist-get 'message draft)
+     (lambda (message)
+       (magit-gerrit-backend-update-draft (magit-gerrit--require 'drafts) change draft message
+                                          (eq (alist-get 'unresolved draft) t))))))
+
+(defun magit-gerrit-delete-draft (draft)
+  "Delete the DRAFT comment at point."
+  (interactive (list (magit-gerrit--draft-at-point-or-error)))
+  (when (y-or-n-p "Delete this draft? ")
+    (magit-gerrit--with-change drafts (change backend)
+      (magit-gerrit-backend-delete-draft backend change draft))))
+
+(defun magit-gerrit-publish-drafts (args)
+  "Publish the draft comments of the change at point, using transient ARGS."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--with-change drafts (change backend)
+    (magit-gerrit-backend-publish-drafts backend change (magit-gerrit--review-options args))))
+
+
+;;; More actions on changes
+
+(defun magit-gerrit-set-hashtags (hashtags)
+  "Set the HASHTAGS of the change at point."
+  (interactive
+   (let ((change (magit-gerrit--change-at-point-or-error)))
+     (magit-gerrit--require 'hashtags)
+     (list (completing-read-multiple "Hashtags (comma separated): "
+                                     (magit-gerrit-change-hashtags change) nil nil
+                                     (string-join (magit-gerrit-change-hashtags change) ",")))))
+  (magit-gerrit--with-change hashtags (change backend)
+    (let ((old (magit-gerrit-change-hashtags change))
+          (new (seq-uniq (mapcar #'string-trim hashtags))))
+      (magit-gerrit-backend-set-hashtags backend change
+                                         (seq-difference new old) (seq-difference old new)))))
+
+(defun magit-gerrit-toggle-star ()
+  "Star the change at point, or unstar it if it is starred."
+  (interactive)
+  (magit-gerrit--with-change star (change backend)
+    (let ((starred (not (magit-gerrit-change-starred-p change))))
+      (magit-gerrit-backend-set-starred backend change starred)
+      (message (if starred "Starred change %s" "Unstarred change %s")
+               (magit-gerrit-change-number change)))))
+
+(defun magit-gerrit-toggle-private (args)
+  "Mark the change at point as private, or as public, using transient ARGS."
+  (interactive (list (magit-gerrit-arguments)))
+  (magit-gerrit--with-change private (change backend)
+    (magit-gerrit-backend-set-private backend change (not (magit-gerrit-change-private-p change))
+                                      (magit-gerrit--review-options args))))
+
+(defun magit-gerrit-edit-commit-message (args)
+  "Edit the commit message of the change at point, using transient ARGS.
+Gerrit creates a new patchset with the new message."
+  (interactive (list (magit-gerrit-arguments)))
+  (let ((change (magit-gerrit--change-at-point-or-error)))
+    (magit-gerrit--require 'edit-message)
+    (let ((message (or (magit-gerrit-change-commit-message change)
+                       (magit-gerrit-change-commit-message
+                        (magit-gerrit--get-change (magit-gerrit-change-number change))))))
+      (magit-gerrit--read-message
+       "Commit message" (format "Change %s" (magit-gerrit-change-number change)) message
+       (lambda (new)
+         (magit-gerrit-backend-set-commit-message
+          (magit-gerrit--require 'edit-message) change (concat (string-trim-right new) "\n")
+          (magit-gerrit--review-options args)))))))
+
+(defun magit-gerrit-revert-change (args)
+  "Create a change reverting the change at point, using transient ARGS.
+The \"--message=\" argument is the commit message of the revert.
+Show the created change."
+  (interactive (list (magit-gerrit-arguments)))
+  (let* ((change (magit-gerrit--change-at-point-or-error))
+         (revert (magit-gerrit-backend-revert (magit-gerrit--require 'revert) change
+                                              (magit-gerrit--review-options args))))
+    (when-let* ((number (magit-gerrit-change-number revert)))
+      (message "Created the revert change %s" number)
+      (magit-gerrit-show-change number))))
+
+(defun magit-gerrit-cherry-pick-change (branch args)
+  "Cherry-pick the change at point to BRANCH on Gerrit, using transient ARGS.
+The patchset at point is cherry-picked, or the current one.  The
+\"--message=\" argument is the commit message of the cherry-pick.
+Show the created change."
+  (interactive (progn (magit-gerrit--require 'cherry-pick)
+                      (list (magit-gerrit--read-target-branch "Cherry-pick to branch: ")
+                            (magit-gerrit-arguments))))
+  (let* ((change (magit-gerrit--change-at-point-or-error))
+         (revision (or (alist-get 'revision (magit-gerrit-patchset-at-point))
+                       (magit-gerrit-change-revision change)))
+         (new (magit-gerrit-backend-cherry-pick (magit-gerrit--require 'cherry-pick)
+                                                change revision branch
+                                                (magit-gerrit--review-options args))))
+    (when-let* ((number (magit-gerrit-change-number new)))
+      (message "Created the change %s on %s" number branch)
+      (magit-gerrit-show-change number))))
 
 
 ;;; Commit-msg hook
 
 (defun magit-gerrit--web-url ()
   "Return the base URL of the Gerrit web interface.
-See `magit-gerrit-web-url'."
+See `magit-gerrit-web-url'.  Otherwise, ask the backend, or use the
+host of the remote."
   (or magit-gerrit-web-url
-      (when-let* ((project (magit-gerrit-get-project))
-                  (change (car (ignore-errors
-                                 (magit-gerrit--query-changes
-                                  (list (concat "project:" project) "limit:1")))))
-                  (url (magit-gerrit-change-url change))
-                  ((string-match "\\`\\(.*?\\)\\(?:/c/.*\\|/[0-9]+/?\\)\\'" url)))
-        (match-string 1 url))
-      (when-let* ((remote-url (magit-gerrit-get-remote-url))
-                  (host (url-host (url-generic-parse-url remote-url))))
+      (when-let* ((backend (magit-gerrit-current-backend t)))
+        (ignore-errors (magit-gerrit-backend-web-url backend)))
+      (when-let* ((host (magit-gerrit--remote-host (magit-gerrit-get-remote-url))))
         (concat "https://" host))))
 
 (defun magit-gerrit--commit-msg-hook-file ()
@@ -1450,31 +2225,15 @@ Return non-nil on success."
                        (looking-at "#!"))
               (let ((coding-system-for-write 'no-conversion))
                 (write-region (point) (point-max) file nil 'silent))
-              (magit-gerrit--log (list "GET" url) 0 "")
+              (magit-gerrit--log (concat "GET " url) 200)
               t))
         (kill-buffer buffer)))))
 
-(defun magit-gerrit--download-hook-scp (file)
-  "Download the commit-msg hook from the SSH daemon to FILE.
-Return non-nil on success."
-  (let ((tmp (make-temp-file "magit-gerrit-hook-"))
-        (default-directory temporary-file-directory))
-    (unwind-protect
-        (when (seq-some
-               (lambda (legacy)
-                 (let ((args (append (when legacy '("-O"))
-                                     (list "-P" (number-to-string magit-gerrit-port)
-                                           (concat magit-gerrit-ssh-creds ":hooks/commit-msg")
-                                           tmp))))
-                   (let ((exit-code (apply #'call-process magit-gerrit-scp-program nil nil nil args)))
-                     (magit-gerrit--log (cons magit-gerrit-scp-program args) exit-code "")
-                     (eq exit-code 0))))
-               ;; "-O" (legacy scp protocol) is needed since OpenSSH 9, but older
-               ;; versions don't know it
-               '(t nil))
-          (copy-file tmp file t)
-          t)
-      (delete-file tmp))))
+(defvar magit-gerrit-commit-msg-hook-downloaders
+  (list (cons 'https #'magit-gerrit--download-hook-https))
+  "Functions downloading the commit-msg hook, as (METHOD . FUNCTION).
+FUNCTION is called with the destination file, it returns non-nil on
+success.  See `magit-gerrit-commit-msg-hook-methods'.")
 
 (defun magit-gerrit-install-commit-msg-hook (&optional force)
   "Install Gerrit's commit-msg hook, generating the Change-Id of commits.
@@ -1487,9 +2246,8 @@ methods of `magit-gerrit-commit-msg-hook-methods' are tried in order."
               (y-or-n-p (format "Replace the existing %s? " file)))
       (make-directory (file-name-directory file) t)
       (if (seq-some (lambda (method)
-                      (pcase method
-                        ('https (magit-gerrit--download-hook-https file))
-                        ('scp (magit-gerrit--download-hook-scp file))))
+                      (when-let* ((fn (alist-get method magit-gerrit-commit-msg-hook-downloaders)))
+                        (funcall fn file)))
                     magit-gerrit-commit-msg-hook-methods)
           (progn (set-file-modes file #o755)
                  (message "Installed the commit-msg hook in %s" file)
@@ -1705,11 +2463,11 @@ See `magit-gerrit-annotate-log'."
                                      (concat " " (magit-gerrit--format-change-summary change))))))
       (error (message "magit-gerrit: cannot annotate the log: %s" (error-message-string err))))))
 
-(defun magit-gerrit--read-commit-change (prompt)
-  "Return the change of the commit at point, or of a commit read with PROMPT.
+(defun magit-gerrit--read-commit-change (prompt &optional rev)
+  "Return the change of REV, the commit at point or a commit read with PROMPT.
 When the Change-Id matches several changes (cherry-picks on other
 branches), let the user choose."
-  (let* ((rev (or (magit-commit-at-point) (magit-read-branch-or-commit prompt)))
+  (let* ((rev (or rev (magit-commit-at-point) (magit-read-branch-or-commit prompt)))
          (changes (or (magit-gerrit--commit-changes rev)
                       (user-error "No Gerrit change for %s" rev))))
     (if (length= changes 1)
@@ -1746,6 +2504,11 @@ branches), let the user choose."
   :doc "Keymap for the inline comment sections of a Gerrit change buffer."
   "<remap> <magit-visit-thing>" #'magit-gerrit-show-patchset-file)
 
+(defvar-keymap magit-gerrit-draft-section-map
+  :doc "Keymap for the draft comment sections of a Gerrit change buffer."
+  "<remap> <magit-visit-thing>" #'magit-gerrit-edit-draft
+  "<remap> <magit-delete-thing>" #'magit-gerrit-delete-draft)
+
 (defvar-keymap magit-gerrit-dependency-section-map
   :doc "Keymap for the dependency sections of a Gerrit change buffer."
   "<remap> <magit-visit-thing>" #'magit-gerrit-show-change)
@@ -1760,7 +2523,10 @@ branches), let the user choose."
 \\<magit-gerrit-change-mode-map>\
 Type \\[magit-visit-thing] on a patchset to show it, on a file or an
 inline comment to show the diff of that file, on a dependency to show
-that change.  Type \\[magit-refresh] to fetch the change again.
+that change, on a draft comment to edit it.  Type \\[magit-delete-thing]
+on a draft comment to delete it.  Type \\[magit-refresh] to fetch the
+change again.  The other commands are in the Gerrit menu, see
+`magit-gerrit-dispatch'.
 
 \\{magit-gerrit-change-mode-map}"
   :interactive nil
@@ -1773,10 +2539,9 @@ that change.  Type \\[magit-refresh] to fetch the change again.
   "Return the number of the change shown in a buffer in MAJOR-MODE."
   magit-gerrit-buffer-change-number)
 
-(defconst magit-gerrit--change-query-options
-  '("--current-patch-set" "--patch-sets" "--all-approvals" "--files" "--comments"
-    "--commit-message" "--dependencies" "--submit-records" "--all-reviewers")
-  "Options of the query fetching a change for the change buffer.")
+(defvar-local magit-gerrit--inherited nil
+  "Values of the configuration of the buffer the change buffer was shown from.
+See `magit-gerrit--inherited-values'.")
 
 (defun magit-gerrit--change-number-at-point ()
   "Return the number of the change or dependency at point, or nil."
@@ -1791,23 +2556,19 @@ Interactively, show the change at point or read its number."
   (interactive
    (list (or (magit-gerrit--change-number-at-point)
              (read-number "Change number: "))))
-  (let ((creds magit-gerrit-ssh-creds)
-        (port magit-gerrit-port)
-        (remote magit-gerrit-remote))
+  (magit-gerrit-current-backend)
+  (let ((inherited (magit-gerrit--inherited-values)))
     (magit-setup-buffer #'magit-gerrit-change-mode t
       (magit-gerrit-buffer-change-number number)
-      (magit-gerrit-ssh-creds creds)
-      (magit-gerrit-port port)
-      (magit-gerrit-remote remote))))
+      (magit-gerrit--inherited inherited))))
 
 (defun magit-gerrit-change-refresh-buffer ()
   "Refresh the Gerrit change buffer."
+  (magit-gerrit--inherit-values magit-gerrit--inherited)
   (magit-set-header-line-format (format "Gerrit change %s" magit-gerrit-buffer-change-number))
   (magit-insert-section (gerrit-change-buffer)
     (condition-case err
-        (let ((change (or (car (magit-gerrit--query-changes
-                                (format "change:%s" magit-gerrit-buffer-change-number)
-                                magit-gerrit--change-query-options))
+        (let ((change (or (magit-gerrit--get-change magit-gerrit-buffer-change-number)
                           (user-error "Change %s not found" magit-gerrit-buffer-change-number))))
           (setq magit-gerrit-buffer-change change)
           (magit-set-header-line-format
@@ -1859,7 +2620,8 @@ Interactively, show the change at point or read its number."
        "Status" (string-join
                  (delq nil (list (magit-gerrit-change-status change)
                                  (and (magit-gerrit-change-wip-p change) "WIP")
-                                 (and (eq (alist-get 'private change) t) "PRIVATE")
+                                 (and (magit-gerrit-change-private-p change) "PRIVATE")
+                                 (and (magit-gerrit-change-starred-p change) "★")
                                  (when-let* ((record (car (alist-get 'submitRecords change))))
                                    (format "(submit: %s)" (alist-get 'status record)))))
                  " ")
@@ -1888,6 +2650,7 @@ Interactively, show the change at point or read its number."
    (append (mapcar #'car magit-gerrit-review-labels)
            (mapcar (lambda (label) (alist-get 'label label))
                    (alist-get 'labels (car (alist-get 'submitRecords change))))
+           (mapcar #'car (alist-get 'labelRanges change))
            (mapcar (lambda (approval) (alist-get 'type approval))
                    (magit-gerrit-change-approvals change)))))
 
@@ -1916,16 +2679,28 @@ Interactively, show the change at point or read its number."
       (dolist (requirement (alist-get 'requirements record))
         (insert (propertize "Requirement: " 'font-lock-face 'warning)
                 (or (alist-get 'fallbackText requirement) "") "\n"))
+      (when-let* ((requirements (alist-get 'submitRequirements change)))
+        (insert (propertize "Submit requirements" 'font-lock-face 'magit-section-secondary-heading) "\n")
+        (dolist (requirement requirements)
+          (let ((status (or (alist-get 'status requirement) "")))
+            (insert (format "  %-22s" (alist-get 'name requirement))
+                    (propertize status 'font-lock-face
+                                (pcase status
+                                  ((or "SATISFIED" "OVERRIDDEN" "FORCED") 'success)
+                                  ((or "UNSATISFIED" "ERROR") 'error)
+                                  (_ 'shadow)))
+                    "\n"))))
       (insert "\n"))))
 
 (defun magit-gerrit-insert-change-reviewers ()
-  "Insert the reviewers of the change."
-  (when-let* ((reviewers (alist-get 'allReviewers magit-gerrit-buffer-change)))
-    (magit-insert-section (gerrit-reviewers)
-      (magit-insert-heading (format "Reviewers (%d)" (length reviewers)))
-      (dolist (reviewer reviewers)
-        (insert (magit-gerrit--format-account reviewer) "\n"))
-      (insert "\n"))))
+  "Insert the reviewers and the CCs of the change."
+  (pcase-dolist (`(,key . ,title) '((allReviewers . "Reviewers") (ccs . "CC")))
+    (when-let* ((accounts (alist-get key magit-gerrit-buffer-change)))
+      (magit-insert-section (gerrit-reviewers key)
+        (magit-insert-heading (format "%s (%d)" title (length accounts)))
+        (dolist (account accounts)
+          (insert (magit-gerrit--format-account account) "\n"))
+        (insert "\n")))))
 
 (defun magit-gerrit-insert-change-dependencies ()
   "Insert the dependencies and the dependents of the change."
@@ -1976,11 +2751,14 @@ Interactively, show the change at point or read its number."
                   (propertize (substring (or (alist-get 'revision patchset) "") 0 10)
                               'font-lock-face 'magit-hash)
                   " "
-                  (propertize (format "%7s" (format "+%d" (or (alist-get 'sizeInsertions patchset) 0)))
-                              'font-lock-face 'diff-added)
-                  " "
-                  (propertize (format "%-7s" (format "-%d" (abs (or (alist-get 'sizeDeletions patchset) 0))))
-                              'font-lock-face 'diff-removed)
+                  (if (alist-get 'sizeInsertions patchset)
+                      (concat
+                       (propertize (format "%7s" (format "+%d" (alist-get 'sizeInsertions patchset)))
+                                   'font-lock-face 'diff-added)
+                       " "
+                       (propertize (format "%-7s" (format "-%d" (abs (or (alist-get 'sizeDeletions patchset) 0))))
+                                   'font-lock-face 'diff-removed))
+                    (make-string 15 ?\s))
                   (format "%-17s" (or (alist-get 'kind patchset) ""))
                   (magit-gerrit--format-account (alist-get 'uploader patchset))
                   "  "
@@ -2006,26 +2784,117 @@ Interactively, show the change at point or read its number."
                   "\n")))
       (insert "\n"))))
 
+(defun magit-gerrit--comment-threads (comments)
+  "Group COMMENTS in threads, using their `id' and `inReplyTo'.
+Return a list of threads, lists of comments starting with the first
+comment of the thread, the replies being sorted by date.  Comments
+without identifier have their own thread."
+  (let ((by-id (make-hash-table :test #'equal))
+        threads)
+    (dolist (comment comments)
+      (when-let* ((id (alist-get 'id comment)))
+        (puthash id comment by-id)))
+    (dolist (comment comments)
+      (let ((root comment) (depth 0))
+        (while-let (((< depth 100))
+                    (parent (gethash (alist-get 'inReplyTo root) by-id)))
+          (setq root parent)
+          (cl-incf depth))
+        (if-let* ((thread (assq root threads)))
+            (setcdr thread (cons comment (cdr thread)))
+          (push (list root comment) threads))))
+    (mapcar (lambda (thread)
+              (let ((root (car thread)))
+                (cons root (remq root (sort (nreverse (cdr thread))
+                                            (lambda (a b) (< (or (alist-get 'updated a) 0)
+                                                             (or (alist-get 'updated b) 0))))))))
+            (nreverse threads))))
+
+(defun magit-gerrit--thread-unresolved-p (thread)
+  "Return non-nil when the last comment of THREAD is unresolved."
+  (eq (alist-get 'unresolved (car (last thread))) t))
+
+(defun magit-gerrit--comment-body (comment &optional indent)
+  "Return the message of COMMENT, indented with INDENT spaces (2 by default)."
+  (concat (replace-regexp-in-string
+           "^" (make-string (or indent 2) ?\s)
+           (string-trim-right (or (alist-get 'message comment) "")))
+          "\n"))
+
+(defun magit-gerrit--comment-date (comment)
+  "Return the date of COMMENT, formatted, or an empty string."
+  (if-let* ((time (alist-get 'updated comment)))
+      (propertize (format-time-string "%F %R" time) 'font-lock-face 'magit-log-date)
+    ""))
+
+(defun magit-gerrit--insert-thread (thread patchset)
+  "Insert the comments of THREAD, on PATCHSET."
+  (let ((root (car thread)))
+    (magit-insert-section (gerrit-comment (cons (cons 'patchset patchset) root))
+      (magit-insert-heading
+        (propertize (magit-gerrit--format-location (alist-get 'file root) (alist-get 'line root))
+                    'font-lock-face 'magit-filename)
+        (if (equal (alist-get 'side root) "PARENT") " (base)" "")
+        "  "
+        (magit-gerrit--format-account (alist-get 'reviewer root))
+        "  "
+        (magit-gerrit--comment-date root)
+        (cond ((magit-gerrit--thread-unresolved-p thread)
+               (propertize "  UNRESOLVED" 'font-lock-face 'warning))
+              ((alist-get 'id root)
+               (propertize "  resolved" 'font-lock-face 'shadow))
+              (t "")))
+      (insert (magit-gerrit--comment-body root))
+      (dolist (reply (cdr thread))
+        (magit-insert-section (gerrit-comment (cons (cons 'patchset patchset) reply))
+          (magit-insert-heading
+            "  ↳ "
+            (magit-gerrit--format-account (alist-get 'reviewer reply))
+            "  "
+            (magit-gerrit--comment-date reply))
+          (insert (magit-gerrit--comment-body reply 4)))))))
+
 (defun magit-gerrit-insert-change-comments ()
-  "Insert the inline comments of all the patchsets."
-  (let ((patchsets (seq-filter (lambda (ps) (alist-get 'comments ps))
-                               (alist-get 'patchSets magit-gerrit-buffer-change))))
+  "Insert the inline comments of all the patchsets, grouped in threads."
+  (let* ((patchsets (seq-filter (lambda (ps) (alist-get 'comments ps))
+                                (alist-get 'patchSets magit-gerrit-buffer-change)))
+         (threads (mapcar (lambda (ps) (cons ps (magit-gerrit--comment-threads (alist-get 'comments ps))))
+                          patchsets))
+         (count (apply #'+ (mapcar (lambda (ps) (length (alist-get 'comments ps))) patchsets)))
+         (unresolved (seq-count #'magit-gerrit--thread-unresolved-p (mapcan #'cdr (copy-tree threads)))))
     (when patchsets
       (magit-insert-section (gerrit-comments)
-        (magit-insert-heading "Inline comments")
-        (dolist (patchset patchsets)
+        (magit-insert-heading
+          (format "Inline comments (%d%s)" count
+                  (if (> unresolved 0) (format ", %d unresolved" unresolved) "")))
+        (pcase-dolist (`(,patchset . ,ps-threads) threads)
           (magit-insert-section (gerrit-patchset-comments (alist-get 'number patchset))
             (magit-insert-heading (format "Patchset %s" (alist-get 'number patchset)))
-            (dolist (comment (alist-get 'comments patchset))
-              (magit-insert-section (gerrit-comment (cons (alist-get 'file comment) patchset))
-                (magit-insert-heading
-                  (propertize (format "%s:%s" (alist-get 'file comment) (or (alist-get 'line comment) ""))
-                              'font-lock-face 'magit-filename)
-                  "  "
-                  (magit-gerrit--format-account (alist-get 'reviewer comment)))
-                (insert (replace-regexp-in-string
-                         "^" "  " (string-trim-right (or (alist-get 'message comment) "")))
-                        "\n")))))
+            (dolist (thread ps-threads)
+              (magit-gerrit--insert-thread thread patchset))))
+        (insert "\n")))))
+
+(defun magit-gerrit-insert-change-drafts ()
+  "Insert the draft comments of the user."
+  (let ((change magit-gerrit-buffer-change))
+    (when-let* ((drafts (magit-gerrit-change-drafts change)))
+      (magit-insert-section (gerrit-drafts)
+        (magit-insert-heading (format "Draft comments (%d)" (length drafts)))
+        (dolist (draft drafts)
+          (let* ((number (alist-get 'patchSet draft))
+                 (patchset (or (seq-find (lambda (ps) (equal (alist-get 'number ps) number))
+                                         (alist-get 'patchSets change))
+                               `((number . ,number) (revision . ,(alist-get 'revision draft))))))
+            (magit-insert-section (gerrit-draft (cons (cons 'patchset patchset) draft))
+              (magit-insert-heading
+                (propertize (magit-gerrit--format-location (alist-get 'file draft) (alist-get 'line draft))
+                            'font-lock-face 'magit-filename)
+                (format "  patchset %s" number)
+                (if (alist-get 'inReplyTo draft) "  (reply)" "")
+                (if (eq (alist-get 'unresolved draft) t)
+                    (propertize "  UNRESOLVED" 'font-lock-face 'warning)
+                  ""))
+              (insert (magit-gerrit--comment-body draft)))))
         (insert "\n")))))
 
 (defun magit-gerrit--fetch-revision (patchset)
@@ -2035,52 +2904,141 @@ Interactively, show the change at point or read its number."
       (magit-gerrit-fetch-patchset (alist-get 'ref patchset)))
     revision))
 
+(defun magit-gerrit--setup-diff-buffer (buffer mode revision change inherited)
+  "Record REVISION of CHANGE in BUFFER, or in the buffer in MODE.
+BUFFER displays REVISION.  INHERITED are the values of
+`magit-gerrit--inherited-values' of the change buffer.  This lets
+`magit-gerrit-comment' comment on the lines of the diff."
+  (when-let* ((buffer (if (bufferp buffer) buffer (magit-get-mode-buffer mode))))
+    (with-current-buffer buffer
+      (magit-gerrit--inherit-values inherited)
+      (setq-local magit-gerrit--diff-change (and change (cons revision change))))))
+
 (defun magit-gerrit-show-patchset (patchset)
   "Show the commit of PATCHSET, fetching it if needed."
   (interactive (list (or (magit-gerrit-patchset-at-point)
                          (magit-gerrit-change-patchset
                           (magit-gerrit--change-at-point-or-error)))))
-  (magit-show-commit (magit-gerrit--fetch-revision patchset)))
+  (let ((change (magit-gerrit-change-at-point))
+        (inherited (magit-gerrit--inherited-values))
+        (revision (magit-gerrit--fetch-revision patchset)))
+    (magit-gerrit--setup-diff-buffer (magit-show-commit revision) 'magit-revision-mode
+                                     revision change inherited)))
+
+(defun magit-gerrit--file-at-point ()
+  "Return the file at point in a change buffer and its patchset, as a list."
+  (if-let* ((value (magit-section-value-if 'gerrit-file)))
+      (list (car value) (cdr value))
+    (if-let* ((comment (or (magit-gerrit-comment-at-point) (magit-gerrit-draft-at-point))))
+        (list (alist-get 'file comment) (alist-get 'patchset comment))
+      (user-error "No file at point"))))
 
 (defun magit-gerrit-show-patchset-file (file patchset)
-  "Show the diff of FILE in PATCHSET, fetching it if needed."
-  (interactive (let ((value (or (magit-section-value-if '(gerrit-file gerrit-comment))
-                                (user-error "No file at point"))))
-                 (list (car value) (cdr value))))
-  (let ((revision (magit-gerrit--fetch-revision patchset)))
-    (magit-diff-range (format "%s^..%s" revision revision) nil (list file))))
+  "Show the diff of FILE in PATCHSET, fetching it if needed.
+Comment on its lines with `magit-gerrit-comment'."
+  (interactive (magit-gerrit--file-at-point))
+  (when (string-prefix-p "/" file)
+    (user-error "No diff for %s" (magit-gerrit--format-location file nil)))
+  (let ((change (magit-gerrit-change-at-point))
+        (inherited (magit-gerrit--inherited-values))
+        (revision (magit-gerrit--fetch-revision patchset)))
+    (magit-gerrit--setup-diff-buffer
+     (magit-diff-range (format "%s^..%s" revision revision) nil (list file))
+     'magit-diff-mode revision change inherited)))
 
 
 ;;; Transient
 
+(defmacro magit-gerrit--define-feature-predicates (&rest features)
+  "Define the predicates telling whether the backend supports FEATURES.
+The predicate of FEATURE is named magit-gerrit--supports-FEATURE-p,
+the menus use them to show the unsupported commands as unavailable."
+  `(progn
+     ,@(mapcar (lambda (feature)
+                 `(defun ,(intern (format "magit-gerrit--supports-%s-p" feature)) ()
+                    ,(format "Return non-nil when the backend supports the feature `%s'.
+See `magit-gerrit-features'." feature)
+                    (magit-gerrit--supports-p ',feature)))
+               features)))
+
+(magit-gerrit--define-feature-predicates
+ vote submit abandon restore rebase move topic reviewers cc wip comment reply drafts
+ hashtags star private edit-message revert cherry-pick)
+
 ;;;###autoload (autoload 'magit-gerrit-dispatch "magit-gerrit" nil t)
 (transient-define-prefix magit-gerrit-dispatch ()
-  "Transient menu for `magit-gerrit' commands."
+  "Transient menu for `magit-gerrit' commands.
+The commands the backend doesn't support are shown as unavailable."
+  :incompatible '(("--unresolved" "--resolved"))
   ["Arguments"
    ("-m" "Message"                         "--message=")
    ("-n" "Notify"                          "--notify="
     :choices ("NONE" "OWNER" "OWNER_REVIEWERS" "ALL"))
-   ("-s" "Submit after voting"             "--submit")]
+   ("-s" "Submit after voting"             "--submit")
+   ("-d" "Save comments as drafts"         "--draft"
+    :inapt-if-not magit-gerrit--supports-drafts-p)
+   ("-u" "Unresolved comment"              "--unresolved")
+   ("-r" "Resolved comment"                "--resolved")]
   [["Change"
     ("RET" "Show"                          magit-gerrit-show-change)
     ("b" "Browse"                          magit-gerrit-browse-review)
-    ("v" "Vote"                            magit-gerrit-vote)
-    ("S" "Submit"                          magit-gerrit-submit-review)
-    ("u" "Rebase"                          magit-gerrit-rebase-review)
-    ("M" "Move to branch"                  magit-gerrit-move-review)
-    ("B" "Abandon"                         magit-gerrit-abandon-review)
-    ("R" "Restore"                         magit-gerrit-restore-review)]
+    ("v" "Vote"                            magit-gerrit-vote
+     :inapt-if-not magit-gerrit--supports-vote-p)
+    ("S" "Submit"                          magit-gerrit-submit-review
+     :inapt-if-not magit-gerrit--supports-submit-p)
+    ("u" "Rebase"                          magit-gerrit-rebase-review
+     :inapt-if-not magit-gerrit--supports-rebase-p)
+    ("M" "Move to branch"                  magit-gerrit-move-review
+     :inapt-if-not magit-gerrit--supports-move-p)
+    ("B" "Abandon"                         magit-gerrit-abandon-review
+     :inapt-if-not magit-gerrit--supports-abandon-p)
+    ("R" "Restore"                         magit-gerrit-restore-review
+     :inapt-if-not magit-gerrit--supports-restore-p)]
    ["Reviewers & state"
-    ("A" "Add reviewers"                   magit-gerrit-add-reviewer)
-    ("K" "Remove reviewers"                magit-gerrit-remove-reviewer)
-    ("c" "Add CC"                          magit-gerrit-add-cc)
-    ("T" "Set topic"                       magit-gerrit-set-topic)
-    ("w" "Mark work in progress"           magit-gerrit-mark-wip)
-    ("W" "Mark ready for review"           magit-gerrit-mark-ready)]
-   ["Patchset"
+    ("A" "Add reviewers"                   magit-gerrit-add-reviewer
+     :inapt-if-not magit-gerrit--supports-reviewers-p)
+    ("K" "Remove reviewers"                magit-gerrit-remove-reviewer
+     :inapt-if-not magit-gerrit--supports-reviewers-p)
+    ("c" "Add CC"                          magit-gerrit-add-cc
+     :inapt-if-not magit-gerrit--supports-cc-p)
+    ("T" "Set topic"                       magit-gerrit-set-topic
+     :inapt-if-not magit-gerrit--supports-topic-p)
+    ("#" "Set hashtags"                    magit-gerrit-set-hashtags
+     :inapt-if-not magit-gerrit--supports-hashtags-p)
+    ("w" "Mark work in progress"           magit-gerrit-mark-wip
+     :inapt-if-not magit-gerrit--supports-wip-p)
+    ("W" "Mark ready for review"           magit-gerrit-mark-ready
+     :inapt-if-not magit-gerrit--supports-wip-p)
+    ("I" "Toggle private"                  magit-gerrit-toggle-private
+     :inapt-if-not magit-gerrit--supports-private-p)
+    ("*" "Toggle star"                     magit-gerrit-toggle-star
+     :inapt-if-not magit-gerrit--supports-star-p)]
+   ["Comments"
+    ("C" "Comment"                         magit-gerrit-comment
+     :inapt-if-not magit-gerrit--supports-comment-p)
+    ("a" "Reply"                           magit-gerrit-reply
+     :inapt-if-not magit-gerrit--supports-reply-p)
+    ("f" "Reply \"Done\" (resolve)"        magit-gerrit-reply-done
+     :inapt-if-not magit-gerrit--supports-reply-p)
+    ("k" "Reply \"Ack\" (resolve)"         magit-gerrit-reply-ack
+     :inapt-if-not magit-gerrit--supports-reply-p)
+    ("p" "Publish drafts"                  magit-gerrit-publish-drafts
+     :inapt-if-not magit-gerrit--supports-drafts-p)
+    ("e" "Edit draft"                      magit-gerrit-edit-draft
+     :inapt-if-not magit-gerrit--supports-drafts-p)
+    ("x" "Delete draft"                    magit-gerrit-delete-draft
+     :inapt-if-not magit-gerrit--supports-drafts-p)]]
+  [["Patchset"
     ("d" "View diff"                       magit-gerrit-view-patchset-diff)
     ("D" "Download (checkout)"             magit-gerrit-download-patchset)
-    ("F" "Cherry-pick"                     magit-gerrit-cherry-pick-patchset)]]
+    ("F" "Cherry-pick"                     magit-gerrit-cherry-pick-patchset)]
+   ["On the server"
+    ("E" "Edit commit message"             magit-gerrit-edit-commit-message
+     :inapt-if-not magit-gerrit--supports-edit-message-p)
+    ("V" "Revert"                          magit-gerrit-revert-change
+     :inapt-if-not magit-gerrit--supports-revert-p)
+    ("L" "Cherry-pick to branch"           magit-gerrit-cherry-pick-change
+     :inapt-if-not magit-gerrit--supports-cherry-pick-p)]]
   [["Others"
     ("P" "Push for review"                 magit-gerrit-push)
     ("/" "Query"                           magit-gerrit-query)
@@ -2117,8 +3075,9 @@ Add the Gerrit reviews section to the status buffer and bind
                        "This mode only makes sense with magit")
                       ((not (magit-gerrit-get-remote-url))
                        "You can set `magit-gerrit-remote' to a valid Gerrit remote")
-                      ((not (magit-gerrit-detect-ssh-creds (magit-gerrit-get-remote-url)))
-                       "You can set `magit-gerrit-ssh-creds' to enable magit-gerrit-mode"))))
+                      ((not (magit-gerrit-current-backend t))
+                       (concat "No Gerrit backend: set `magit-gerrit-ssh-creds' or "
+                               "`magit-gerrit-rest-url' to enable magit-gerrit-mode")))))
       (setq magit-gerrit-mode nil)
       (user-error "%s" err))
     (magit-add-section-hook 'magit-status-sections-hook
@@ -2141,8 +3100,8 @@ Add the Gerrit reviews section to the status buffer and bind
   (let ((remote-url (magit-gerrit-get-remote-url)))
     (when (and remote-url
                (or magit-gerrit-force-enable
-                   (and (magit-gerrit-detect-ssh-creds remote-url)
-                        (string-search magit-gerrit-ssh-creds remote-url))))
+                   (when-let* ((backend (magit-gerrit-current-backend t)))
+                     (magit-gerrit-backend-matches-remote-p backend remote-url))))
       (magit-gerrit-mode 1))))
 
 ;;;###autoload
@@ -2154,5 +3113,10 @@ Add the Gerrit reviews section to the status buffer and bind
   (add-hook 'magit-revision-mode-hook #'magit-gerrit-check-enable t))
 
 (provide 'magit-gerrit)
+
+;; The backends require this file, load them once it is provided
+(cl-eval-when (load eval)
+  (require 'magit-gerrit-ssh)
+  (require 'magit-gerrit-rest))
 
 ;;; magit-gerrit.el ends here
